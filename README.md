@@ -16,7 +16,7 @@ gb-esp-firmware and gb-pico-firmware are forks from the respective repositories 
 
 ## Successful Tests:
 
-- Successfully triggered an achievement in Zelda Link's Awekening
+- Successfully triggered an achievement in Zelda Link's Awekening [https://youtu.be/6lw4mGO8Hv8](https://youtu.be/6lw4mGO8Hv8)
 
 ## Conclusion
 
