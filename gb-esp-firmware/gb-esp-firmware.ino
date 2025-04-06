@@ -1070,10 +1070,13 @@ void loop()
 
     
     // TEST - FORCING TETRIS
-    md5 = "084f1e457749cdec86183189bd88ce69";
+    // md5 = "084f1e457749cdec86183189bd88ce69";
 
     // TEST - FORCING ZELDA LINKS AWAKENING
     md5 = "5bc0913d533000522c7c9cac1ef6f97f";
+
+    // TEST - FORCING SUPER MARIO LAND
+    // md5 = "c6cfb6cb982ac886faa83a1f0e597dc8";
 
     // TEST - SEND MD5 TO PICO
     Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");
