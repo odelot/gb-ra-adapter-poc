@@ -5,79 +5,26 @@
 #include "pico/malloc.h"
 
 #include "pico/multicore.h"
-#include "pico/mutex.h"
 #include "pico/time.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "hardware/clocks.h"
-#include "hardware/pio.h"
-#include "hardware/dma.h"
-#include "hardware/structs/systick.h"
-#include "memory-bus.pio.h"
 #include "retroachievements.h"
+#include "gb_cpu_emu.h"
 
 #include "hardware/timer.h"
 #include <limits.h>
 #include <math.h>
 
-#define BUS_PIO pio0
-#define BUS_SM 0
-
 #define UART_ID uart0
 #define BAUD_RATE 115200
-
-#define GB_D0 0
-#define GB_D1 1
-#define GB_D2 2
-#define GB_D3 3
-#define GB_D4 4
-#define GB_D5 5
-#define GB_D6 6
-#define GB_D7 7
-
-#define GB_A00 8
-#define GB_A01 9
-#define GB_A02 10
-#define GB_A03 11
-#define GB_A04 12
-#define GB_A05 13
-#define GB_A06 14
-#define GB_A07 15
-
-#define GB_A08 16
-#define GB_A09 17
-#define GB_A10 18
-#define GB_A11 19
-#define GB_A12 20
-#define GB_A13 21
-#define GB_A14 22
-#define GB_A15 23
-
-#define GB_WR 24
-#define GB_M2 25
-
 
 #define UART_TX_PIN 28 // GPIO pin for TX
 #define UART_RX_PIN 29 // GPIO pin for RX
 
-const uint16_t GB_D[8] = {GB_D0, GB_D1, GB_D2, GB_D3, GB_D4, GB_D5, GB_D6, GB_D7};
-const uint16_t GB_A[16] = {GB_A00, GB_A01, GB_A02, GB_A03, GB_A04, GB_A05, GB_A06, GB_A07, GB_A08, GB_A09, GB_A10, GB_A11, GB_A12, GB_A13, GB_A14, GB_A15};
-const uint16_t GB_F[2] = {GB_WR, GB_M2};
-
 // CRC32 global variables
 uint32_t crcBegin = 0xFFFFFFFF;
 uint32_t crcEnd = 0xFFFFFFFF;
-
-/*
- * PIO Bus Watcher
- */
-
-volatile uint32_t busPIOemptyMask, busPIOstallMask;
-volatile io_ro_32 *rxf;
-
-uint32_t rawBusData;
-
-mutex_t cpubusMutex;
 
 /*
  * states
@@ -98,366 +45,6 @@ char ra_user[256];
 u_char serial_buffer[SERIAL_BUFFER_SIZE];
 u_char *serial_buffer_head = serial_buffer;
 // u_char command[256];
-
-// memory circular buffer
-
-#define MEMORY_BUFFER_SIZE 2048
-volatile int memory_head = 0;
-volatile int memory_tail = 0;
-
-struct _memory_unit
-{
-    uint32_t address;
-    uint8_t data;
-};
-
-typedef struct _memory_unit memory_unit;
-memory_unit memory_buffer[MEMORY_BUFFER_SIZE];
-
-uint16_t unique_memory_addresses_count = 0;
-uint32_t *unique_memory_addresses = NULL;
-uint8_t *memory_data = NULL;
-
-/*
- * handle GPIO
- */
-
-void resetGPIO()
-{
-    for (int i = 0; i < 8; i += 1)
-    {
-        gpio_init(GB_D[i]);
-        gpio_set_dir(GB_D[i], GPIO_IN);
-        gpio_disable_pulls(GB_D[i]);
-    }
-    for (int i = 0; i < 16; i += 1)
-    {
-        gpio_init(GB_A[i]);
-        gpio_set_dir(GB_A[i], GPIO_IN);
-        gpio_disable_pulls(GB_A[i]);
-    }
-    for (int i = 0; i < 2; i += 1)
-    {
-        gpio_init(GB_F[i]);
-        gpio_set_dir(GB_F[i], GPIO_IN);
-        gpio_disable_pulls(GB_F[i]);
-    }
-}
-
-void initCRC32()
-{
-    for (int i = 0; i < 8; i += 1)
-    {
-        gpio_init(GB_D[i]);
-        gpio_set_dir(GB_D[i], GPIO_IN);
-        gpio_pull_down(GB_D[i]);
-    }
-    for (int i = 0; i < 16; i += 1)
-    {
-        gpio_init(GB_A[i]);
-        gpio_set_dir(GB_A[i], GPIO_OUT);
-        gpio_set_drive_strength(GB_A[i], GPIO_DRIVE_STRENGTH_12MA);
-    }
-    for (int i = 0; i < 2; i += 1)
-    {
-        gpio_init(GB_F[i]);
-        gpio_set_dir(GB_F[i], GPIO_OUT);
-        gpio_set_drive_strength(GB_F[i], GPIO_DRIVE_STRENGTH_12MA);
-    }
-}
-
-void finishCRC32()
-{
-    for (int i = 0; i < 8; i += 1)
-    {
-        gpio_init(GB_D[i]);
-        gpio_set_dir(GB_D[i], GPIO_IN);
-        gpio_disable_pulls(GB_D[i]);
-    }
-    for (int i = 0; i < 16; i += 1)
-    {
-        gpio_init(GB_A[i]);
-        gpio_set_dir(GB_A[i], GPIO_IN);
-        gpio_disable_pulls(GB_A[i]);
-    }
-    for (int i = 0; i < 2; i += 1)
-    {
-        gpio_init(GB_F[i]);
-        gpio_set_dir(GB_F[i], GPIO_IN);
-        gpio_disable_pulls(GB_F[i]);
-    }
-}
-
-/*
- * handle DMA
- */
-
-#define BUFFER_SIZE 8192 // Tamanho de cada buffer
-
-volatile uint32_t buffer_a[BUFFER_SIZE];
-volatile uint32_t buffer_b[BUFFER_SIZE];
-volatile bool readA;
-volatile bool readingA;
-volatile bool readingB;
-
-int dma_chan_0, dma_chan_1; // Canais do DMA
-
-// DMA channel handler, not in memory to speed it up
-void __not_in_flash_func(dma_handler)()
-{
-
-    // Did channel0 triggered the irq?
-    if (dma_channel_get_irq0_status(dma_chan_0))
-    {
-        // Clear the irq
-        dma_channel_acknowledge_irq0(dma_chan_0);
-        // Rewrite the write address without triggering the channel
-        dma_channel_set_write_addr(dma_chan_0, buffer_a, false);
-        // dma_channel_set_write_addr(dma_chan_1, buffer_b, true);
-        if (readingB)
-        {
-            printf("m_");
-        }
-    }
-    else
-    {
-        // Clear the irq
-        dma_channel_acknowledge_irq0(dma_chan_1);
-        // Rewrite the write address without triggering the channel
-        dma_channel_set_write_addr(dma_chan_1, buffer_b, false);
-        // dma_channel_set_write_addr(dma_chan_0, buffer_a, true);
-        if (readingA)
-        {
-            printf("m_");
-        }
-    }
-}
-
-void setup_dma()
-{
-    memset((void *)buffer_a, 0, BUFFER_SIZE * sizeof(uint32_t));
-    memset((void *)buffer_b, 0, BUFFER_SIZE * sizeof(uint32_t));
-
-    dma_chan_0 = dma_claim_unused_channel(true);
-    dma_chan_1 = dma_claim_unused_channel(true);
-
-    // Canal 0: Copia do FIFO do PIO para buffer_a
-
-    dma_channel_config c0 = dma_channel_get_default_config(dma_chan_0);
-    channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
-    channel_config_set_read_increment(&c0, false);
-    channel_config_set_write_increment(&c0, true);
-    channel_config_set_dreq(&c0, pio_get_dreq(BUS_PIO, BUS_SM, false));
-    channel_config_set_chain_to(&c0, dma_chan_1); // Quando terminar, ativa o canal 1
-    // channel_config_set_irq_quiet(&c0, true);      // Não gera interrupção quando terminar
-    channel_config_set_high_priority(&c0, true);
-    channel_config_set_enable(&c0, true);
-
-    dma_channel_set_irq0_enabled(dma_chan_0, true); // Enable IRQ 0
-
-    // Canal 1 : Copia do FIFO do PIO para buffer_b
-    dma_channel_config c1 = dma_channel_get_default_config(dma_chan_1);
-    channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
-    channel_config_set_read_increment(&c1, false);
-    channel_config_set_write_increment(&c1, true);
-    channel_config_set_dreq(&c1, pio_get_dreq(BUS_PIO, BUS_SM, false));
-    channel_config_set_chain_to(&c1, dma_chan_0); // Quando terminar, ativa o canal 0
-    // channel_config_set_irq_quiet(&c1, true);      // Não gera interrupção
-    channel_config_set_high_priority(&c1, true);
-    channel_config_set_enable(&c1, true);
-
-    dma_channel_set_irq0_enabled(dma_chan_1, true); // Enable IRQ 0
-
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
-    irq_set_enabled(DMA_IRQ_0, true);
-    irq_set_priority(DMA_IRQ_0, 0);
-
-    dma_channel_configure(
-        dma_chan_1, &c1,
-        buffer_b,              // Destino
-        &BUS_PIO->rxf[BUS_SM], // Fonte: FIFO do PIO
-        BUFFER_SIZE,           // Tamanho da transferência
-        false);
-
-    dma_channel_configure(
-        dma_chan_0, &c0,
-        buffer_a,              // Destino
-        &BUS_PIO->rxf[BUS_SM], // Fonte: FIFO do PIO
-        BUFFER_SIZE,           // Tamanho da transferência
-        true);
-}
-
-/*
- * handle pio
- */
-
-void setupPIO()
-{
-    for (int i = 0; i < 28; i++) // reset all GPIOs connected to NES
-        gpio_init(i);
-    uint offset = pio_add_program(BUS_PIO, &memoryBus_program);
-    memoryBus_program_init(BUS_PIO, BUS_SM, offset, (float) 9.0f);
-}
-
-/*
- * Memory circula buffer
- */
-
-unsigned int memory_buffer_size()
-{
-    return (memory_head - memory_tail + MEMORY_BUFFER_SIZE) % MEMORY_BUFFER_SIZE;
-}
-
-void add_to_memory_buffer(uint32_t address, uint8_t data)
-{
-    memory_buffer[memory_head].address = address;
-    memory_buffer[memory_head].data = data;
-    memory_head = (memory_head + 1) % MEMORY_BUFFER_SIZE;
-    if (memory_head == memory_tail)
-    {
-        printf("Buffer full\n");
-        // Buffer full, discard or replace oldest data
-        memory_tail = (memory_tail + 1) % MEMORY_BUFFER_SIZE;
-    }
-}
-
-memory_unit read_from_memory_buffer()
-{
-    if (memory_head == memory_tail)
-    {
-        // Buffer vazio
-        memory_unit empty;
-        empty.address = 0;
-        empty.data = 0;
-        return empty;
-    }
-    memory_unit data = memory_buffer[memory_tail];
-    memory_tail = (memory_tail + 1) % MEMORY_BUFFER_SIZE;
-    return data;
-}
-
-// handle memory bus
-
-void print_buffer(uint32_t *buffer, int index)
-{
-    int min = index - 7;
-    int max = index + 1;
-    if (min < 0)
-    {
-        min = 0;
-    }
-    if (max >= BUFFER_SIZE)
-    {
-        max = BUFFER_SIZE - 1;
-    }
-    for (int i = min; i <= max; i += 1)
-    {
-        printf("%p\n", buffer[i]);
-    }
-    printf("\n");
-}
-
-inline void try_add_to_circular_buffer(uint32_t address, uint8_t data)
-{
-
-    // printf("A: %p, D: %p\n", address, data);
-    // if (address == 0xc212 || address == 0xc203) {
-    //     printf("Address: %p, Data: %p\n", address, data );
-    // }
-    // binary search
-    int bot = 0;
-    int top = unique_memory_addresses_count - 1;
-    while (bot < top)
-    {
-        int mid = top - (top - bot) / 2;
-
-        if (address < unique_memory_addresses[mid])
-        {
-            top = mid - 1;
-        }
-        else
-        {
-            bot = mid;
-        }
-    }
-    if (unique_memory_addresses[top] == address)
-    {
-        add_to_memory_buffer(address, data);
-    }
-}
-
-void handleMemoryBus()
-{
-    // To be executed on second core
-    mutex_init(&cpubusMutex);
-    mutex_enter_blocking(&cpubusMutex); // Default is that this thread is in charge of the bus and its history array. We only yield occasionally.
-
-    setupPIO();
-    setup_dma();
-    pio_sm_set_enabled(BUS_PIO, BUS_SM, true);
-
-    uint32_t addressValue = 0;
-    uint32_t lastAddressValue = 0;
-    uint8_t data = 0;
-    uint8_t lastData = 0;
-    // uint8_t romsel = 0;
-    uint8_t rw = 0;
-    uint8_t last_rw = 0;
-    readA = true;
-    readingA = false;
-    readingB = false;
-
-    u_int32_t read_count = 0;
-    while (1)
-    {
-        if (!dma_channel_is_busy(dma_chan_0) && readA)
-        {
-            readingA = true;
-            readA = false;
-            for (int i = 0; i < BUFFER_SIZE; i += 1)
-            {
-
-                rawBusData = buffer_a[i];
-                addressValue = (rawBusData >> 8) & 0xFFFF;
-                data = rawBusData;
-
-                rw = (rawBusData >> 24) & 0x1;
-                
-                if (addressValue != lastAddressValue /*&& last_rw == 0*/)
-                {
-                  try_add_to_circular_buffer(lastAddressValue, lastData);
-                }
-                
-                lastAddressValue = addressValue;
-                lastData = data;
-                last_rw = rw;
-            }
-            readingA = false;
-        }
-        else if (!dma_channel_is_busy(dma_chan_1) && !readA)
-        {
-            readingB = true;
-            readA = true;
-            for (int i = 0; i < BUFFER_SIZE; i += 1)
-            {
-                rawBusData = buffer_b[i];
-                addressValue = (rawBusData >> 8) & 0xFFFF;
-                data = rawBusData;
-                rw = (rawBusData >> 24) & 0x1;                
-                
-                
-                if (addressValue != lastAddressValue /*&& last_rw == 0*/)
-                {
-                  try_add_to_circular_buffer(lastAddressValue, lastData);
-                }
-                lastAddressValue = addressValue;
-                lastData = data;
-                last_rw = rw;
-            }
-            readingB = false;
-        }
-    }
-}
 
 bool prefix(const char *pre, const char *str)
 {
@@ -559,65 +146,17 @@ void fifo_print(FIFO_t *fifo)
 
 FIFO_t achievements_fifo;
 
-// not all address are validated, so it is better not use it
+// Read memory directly from emulator's memory[] array
 static uint32_t read_memory_do_nothing(uint32_t address, uint8_t *buffer, uint32_t num_bytes, rc_client_t *client)
 {
     return num_bytes;
 }
 
-static uint32_t read_memory_init(uint32_t address, uint8_t *buffer, uint32_t num_bytes, rc_client_t *client)
-{
-    // handle address mirror
-    // if (address <= 0x1FFF)
-    // {
-    //     address &= 0x07FF;
-    // }
-
-    for (int j = 0; j < num_bytes; j += 1)
-    {
-        address += j;
-        uint8_t found = 0;
-        for (int i = 0; i < unique_memory_addresses_count; i += 1)
-        {
-            if (address == unique_memory_addresses[i])
-            {
-                found = 1;
-                break;
-            }
-        }
-        if (found == 0)
-        {
-            printf("init address %p, num_bytes: %d\n", address, num_bytes);
-            unique_memory_addresses_count += 1;
-            unique_memory_addresses = (uint32_t *)realloc(unique_memory_addresses, unique_memory_addresses_count * sizeof(uint32_t));
-            unique_memory_addresses[unique_memory_addresses_count - 1] = address;
-        }
-        else
-        {
-            printf("init address %p, num_bytes: %d (already monitored)\n", address, num_bytes);
-        }
-        buffer[j] = 0;
-    }
-    return num_bytes;
-}
-
 static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer, uint32_t num_bytes, rc_client_t *client)
 {
-    // handle address mirror
-    // if (address <= 0x1FFF)
-    // {
-    //     address &= 0x07FF;
-    // }
-    for (int i = 0; i < unique_memory_addresses_count; i += 1)
+    for (uint32_t j = 0; j < num_bytes; j++)
     {
-        if (address == unique_memory_addresses[i])
-        {
-            for (int j = 0; j < num_bytes; j += 1)
-            {
-                buffer[j] = memory_data[i + j];
-            }
-            break;
-        }
+        buffer[j] = memory[(address + j) & 0xFFFF];
     }
     return num_bytes;
 }
@@ -639,7 +178,7 @@ static void rc_client_load_game_callback(int result, const char *error_message, 
 {
     if (result == RC_OK)
     {
-        state = 8; // read from circular buffer
+        state = 8; // emulator running, process frames
         if (rc_client_is_game_loaded(g_client))
         {
             printf("Game loaded\n");
@@ -651,26 +190,9 @@ static void rc_client_load_game_callback(int result, const char *error_message, 
             printf(aux);
             uart_puts(UART_ID, aux);
         }
-        rc_client_set_read_memory_function(g_client, read_memory_init);
-        rc_client_do_frame(g_client);
-
-        // bubble sort unique_memory_addresses
-        for (int i = 0; i < unique_memory_addresses_count; i += 1)
-        {
-            for (int j = 0; j < unique_memory_addresses_count - i - 1; j += 1)
-            {
-                if (unique_memory_addresses[j] > unique_memory_addresses[j + 1])
-                {
-                    uint16_t temp = unique_memory_addresses[j];
-                    unique_memory_addresses[j] = unique_memory_addresses[j + 1];
-                    unique_memory_addresses[j + 1] = temp;
-                }
-            }
-        }
-        memory_data = (uint8_t *)malloc(unique_memory_addresses_count * sizeof(uint8_t));
-        memset(memory_data, 0, unique_memory_addresses_count * sizeof(uint8_t));
         rc_client_set_read_memory_function(g_client, read_memory_ingame);
-        multicore_launch_core1(handleMemoryBus);
+        rc_client_do_frame(g_client);
+        // Emulator already running on Core 1 since boot
     }
     else
     {
@@ -771,9 +293,9 @@ int main()
     stdio_init_all();
     set_sys_clock_khz(250000, true);
 
-    resetGPIO();
-
-    // memset(history, 0, 256 * sizeof(uint32_t));
+    // Start CPU emulator on Core 1 immediately so it tracks from boot ROM
+    // setupPIO() inside emu_core1_entry will handle GPIO init for bus pins
+    multicore_launch_core1(emu_core1_entry);
 
     uart_init(UART_ID, BAUD_RATE);
 
@@ -788,11 +310,100 @@ int main()
     printf(pico_version_command);
     memset(serial_buffer, '\0', SERIAL_BUFFER_SIZE);
 
-    unsigned int frame_counter = 0;
+    // Track emulator debug state changes from Core 1
+    static int last_emu_state = -1;
+    static uint32_t last_stall_print = 0;
+    static const char *last_logged_error = NULL;
 
-    // Do nothing on core 0
+    // Core 0 main loop
     while (true)
     {
+        /* --- Print emulator debug milestones (Core 1 never printf's) --- */
+        int cur_emu_state = emu_debug_state;
+        if (cur_emu_state != last_emu_state) {
+            switch (cur_emu_state) {
+                case EMU_STATE_STARTED:
+                    printf("EMU: Core 1 started\n"); break;
+                case EMU_STATE_WAITING_0100:
+                    printf("EMU: Waiting for 0x0100...\n"); break;
+                case EMU_STATE_RUNNING:
+                    printf("EMU: 0x0100 reached, cycleRatio=%u, first_raw=0x%08X, fifo=%u\n",
+                           (unsigned)emu_debug_cycle_ratio, (unsigned)emu_debug_first_raw,
+                           (unsigned)emu_debug_fifo_level);
+                    break;
+                case EMU_STATE_ERROR:
+                    printf("EMU error (state): %s (opcode 0x%02X)\n",
+                           emu_debug_error ? emu_debug_error : "unknown",
+                           (unsigned)errorOpcode);
+                    break;
+            }
+            last_emu_state = cur_emu_state;
+        }
+
+        /* --- Catch errors independently (survives state race condition) --- */
+        {
+            const char *cur_err = (const char *)emu_debug_error;
+            if (cur_err != NULL && cur_err != last_logged_error) {
+                printf("EMU error: %s (opcode 0x%02X, addr=0x%04X, SP=0x%04X, opcodes=%u, stalls=%u)\n",
+                       cur_err, (unsigned)errorOpcode,
+                       (unsigned)emu_debug_last_addr,
+                       (unsigned)emu_debug_sp,
+                       (unsigned)emu_debug_opcode_count,
+                       (unsigned)emu_debug_stall_count);
+                /* Print bus history (last N entries from ring buffer) */
+                uint32_t tc = emu_trace_count;
+                if (tc > EMU_TRACE_SIZE) tc = EMU_TRACE_SIZE;
+                printf("EMU history (%u recent bus reads):\n", (unsigned)tc);
+                for (uint32_t i = 0; i < tc; i++) {
+                    uint32_t rr = emu_trace_raw[i];
+                    printf("  [%u] raw=0x%08X  addr=0x%04X data=0x%02X ctrl=0x%02X\n",
+                           (unsigned)i,
+                           (unsigned)rr,
+                           (unsigned)(rr & 0xFFFF),
+                           (unsigned)((rr >> 24) & 0xFF),
+                           (unsigned)((rr >> 16) & 0xFF));
+                }
+                /* Print first opcode executions */
+                uint32_t nops = emu_debug_opcode_count;
+                if (nops > EMU_OP_TRACE_SIZE) nops = EMU_OP_TRACE_SIZE;
+                printf("EMU first %u ops:\n", (unsigned)nops);
+                for (uint32_t i = 0; i < nops; i++) {
+                    uint32_t op = emu_trace_ops[i];
+                    printf("  op[%u] addr=0x%04X opcode=0x%02X\n",
+                           (unsigned)i, (unsigned)(op >> 16), (unsigned)(op & 0xFF));
+                }
+                /* Print early bus trace (first N reads from 0x0100 onward) */
+                uint32_t ebc = emu_early_bus_count;
+                if (ebc > EMU_EARLY_BUS_SIZE) ebc = EMU_EARLY_BUS_SIZE;
+                printf("EMU early bus (%u entries, [0]=0x0100, [1..5]=readahead):\n", (unsigned)ebc);
+                for (uint32_t i = 0; i < ebc; i++) {
+                    uint32_t eb = emu_early_bus[i];
+                    printf("  eb[%u] raw=0x%08X addr=0x%04X data=0x%02X ctrl=0x%02X\n",
+                           (unsigned)i,
+                           (unsigned)eb,
+                           (unsigned)(eb & 0xFFFF),
+                           (unsigned)((eb >> 24) & 0xFF),
+                           (unsigned)((eb >> 16) & 0xFF));
+                }
+                last_logged_error = cur_err;
+            } else if (cur_err == NULL) {
+                last_logged_error = NULL;
+            }
+        }
+
+        /* Periodic stall/opcode count report (every ~2 seconds) */
+        if (cur_emu_state == EMU_STATE_RUNNING) {
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (now_ms - last_stall_print > 2000) {
+                last_stall_print = now_ms;
+                printf("EMU: opcodes=%u vblanks=%u sp_resyncs=%u stalls=%u\n",
+                       (unsigned)emu_debug_opcode_count,
+                       (unsigned)emu_debug_vblank_count,
+                       (unsigned)emu_debug_sp_resync_count,
+                       (unsigned)emu_debug_stall_count);
+            }
+        }
+
         // handle on going request and timeout
         if (request_ongoing > 0)
         {
@@ -834,93 +445,34 @@ int main()
         }
         if (state == 8)
         {
-            // read from circular buffer
-
-            if (memory_buffer_size() > 0)
+            // CPU emulator is running on Core 1
+            // Process a frame when the emulator signals VBlank
+            if (emu_new_frame)
             {
-                // printf("r");
-                memory_unit memory = read_from_memory_buffer();
-                // buffer not empty
-                if (nes_reseted == 0 && memory.address < 0x07FF) // started writing on memory ram
+                emu_new_frame = false;
+
+                uint32_t vb = emu_debug_vblank_count;
+                if (vb <= 5 || (vb % 600) == 0) {
+                    printf("EMU: VBlank #%u\n", (unsigned)vb);
+                }
+
+                if (nes_reseted == 0)
                 {
                     nes_reseted = 1;
-                    uart_puts(UART_ID, nes_reseted_command); // NES_RESETED\r\n
-                    for (int i = 0; i < unique_memory_addresses_count; i += 1)
-                    {
-                        printf("%03X ", unique_memory_addresses[i]);
-                    }
-                    printf("\n");
+                    uart_puts(UART_ID, nes_reseted_command);
                 }
 
-                // if (memory.address == 0x4014)
-                // {
-                //     // printf(".");
-                //     // best place to detect a frame so far
-                //     // u_int64_t now = to_ms_since_boot(get_absolute_time());
-                //     // if ((now - last_frame_processed) > 15) // skip frame if we are too close to the last one
-                //     // {
-                //     rc_client_do_frame(g_client);
-                //     // printf("F_");
-                //     last_frame_processed = to_ms_since_boot(get_absolute_time());
-                //     // } else {
-                //     //     printf("S_");
-                //     // }
-
-                //     // memory dump during a frame for DEBUG
-                //     // printf("\nF\n");
-                //     // for (int i = 0; i < unique_memory_addresses_count; i += 1)
-                //     // {
-                //     //     //  "0xH006c=0_0xH0029=33_0xP0101>d0xP0101", // mega man 5
-                //     //     if (unique_memory_addresses[i] == 0x006C || unique_memory_addresses[i] == 0x0029 || unique_memory_addresses[i] == 0x0101)
-                //     //     {
-                //     //         printf("%03X ", memory_data[i]);
-                //     //     }
-                //     // }
-                //     // printf ("\n");
-
-                //     // debug memory circular buffer size
-                //     frame_counter += 1;
-                //     if (frame_counter % 1800 == 0) //~ 30 seconds
-                //     {
-                //         if (memory_buffer_size() > 0)
-                //         {
-                //             printf("F: %d, BS: %d\n", frame_counter, memory_buffer_size());
-                //         }
-                //     }
-                // }
-                // else
+                rc_client_do_frame(g_client);
+                last_frame_processed = to_ms_since_boot(get_absolute_time());
+            }
+            else
+            {
+                // Fallback: ensure we process at least every ~17ms even if VBlank signal is missed
+                uint64_t now = to_ms_since_boot(get_absolute_time());
+                if ((now - last_frame_processed) > 17)
                 {
-                    // if (memory.address <= 0x1FFF)
-                    // {
-                    //     memory.address = memory.address & 0x07FF; // handle ram mirror
-                    // }
-                    for (int i = 0; i < unique_memory_addresses_count; i += 1)
-                    {
-                        if (memory.address == unique_memory_addresses[i])
-                        {
-                            memory_data[i] = memory.data;
-                            break;
-                        }
-                    }
-                }
-
-                // simualte a frame every 33ms with we cannot detect any
-                // example of need: punchout
-                u_int64_t now = to_ms_since_boot(get_absolute_time());
-                if ((now - last_frame_processed) > 16)
-                {
-                    // printf("*");
                     rc_client_do_frame(g_client);
                     last_frame_processed = now;
-                    //     for (int i = 0; i < unique_memory_addresses_count; i += 1)
-                    //     {
-                    //         //  "0xH006c=0_0xH0029=33_0xP0101>d0xP0101", // mega man 5
-                    //         if (unique_memory_addresses[i] == 0x006C || unique_memory_addresses[i] == 0x0029 || unique_memory_addresses[i] == 0x0101)
-                    //         {
-                    //             printf("%03X ", memory_data[i]);
-                    //         }
-                    //     }
-                    //     printf ("\n");
                 }
             }
         }
@@ -1029,13 +581,8 @@ int main()
                     nes_reseted = 0;
                     memset(md5, '\0', 33);
                     crcBegin = 0xFFFFFFFF;
-                    resetGPIO();
-
-                    free(unique_memory_addresses);
-                    free(memory_data);
-                    unique_memory_addresses = NULL;
-                    memory_data = NULL;
-                    unique_memory_addresses_count = 0;
+                    // Note: Core 1 (emulator) will be stopped on next multicore_launch_core1
+                    memset((void *)memory, 0, 0x10000);
                 }
                 else if (prefix("READ_CRC", command))
                 {
