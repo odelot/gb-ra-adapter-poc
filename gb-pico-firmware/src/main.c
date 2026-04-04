@@ -11,6 +11,7 @@
 #include "hardware/clocks.h"
 #include "retroachievements.h"
 #include "gb_cpu_emu.h"
+#include "gb_cart_reader.h"
 
 #include "hardware/timer.h"
 #include <limits.h>
@@ -293,9 +294,12 @@ int main()
     stdio_init_all();
     set_sys_clock_khz(250000, true);
 
-    // Start CPU emulator on Core 1 immediately so it tracks from boot ROM
-    // setupPIO() inside emu_core1_entry will handle GPIO init for bus pins
-    multicore_launch_core1(emu_core1_entry);
+    // NOTE: Core 1 (CPU emulator) is NOT started here.
+    // It is deferred until after cartridge identification, just before
+    // the Game Boy console is powered on (START_WATCH command).
+    // cart_identify() reconfigures GPIO for active driving; Core 1's
+    // setupPIO() would conflict if it were already running.
+    bool core1_launched = false;
 
     uart_init(UART_ID, BAUD_RATE);
 
@@ -433,9 +437,20 @@ int main()
 
         if (state == 1)
         {
-            // read CRC
-            // handleCRC32();
-            state = 2;
+            // Read cartridge ROM and compute MD5 directly on the Pico.
+            // The console is OFF at this point — Pico drives the bus.
+            gb_cart_header_t cart_header;
+            if (cart_identify(md5, &cart_header)) {
+                char cmd[64];
+                sprintf(cmd, "CART_MD5=%s\r\n", md5);
+                uart_puts(UART_ID, cmd);
+                printf("CART_MD5=%s\n", md5);
+                state = 2;
+            } else {
+                uart_puts(UART_ID, "CRC_NOT_FOUND\r\n");
+                printf("CART: identification failed\n");
+                state = 254;
+            }
         }
         if (state == 6)
         {
@@ -593,8 +608,16 @@ int main()
                 else if (prefix("START_WATCH", command))
                 {
                     printf("L:START_WATCH\n");
-                    // init rcheevos
 
+                    // Launch Core 1 (CPU emulator + PIO bus snooping) now.
+                    // The console is about to be powered on.
+                    if (!core1_launched) {
+                        multicore_launch_core1(emu_core1_entry);
+                        core1_launched = true;
+                        printf("Core 1 launched for bus snooping\n");
+                    }
+
+                    // init rcheevos
                     g_client = initialize_retroachievements_client(g_client, read_memory_do_nothing, server_call);
                     rc_client_get_user_agent_clause(g_client, rcheevos_userdata, sizeof(rcheevos_userdata)); // TODO: send to esp32 before doing requests
                     rc_client_set_event_handler(g_client, event_handler);

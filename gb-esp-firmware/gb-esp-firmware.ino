@@ -1059,32 +1059,16 @@ void loop()
   {
     print_line("Identifying cartridge...", 1, 1);
 
-    // digitalWrite(MUX, HIGH); // enable cartridge
-    // delay(10000); // test load everdrive
-    // digitalWrite(MUX, LOW); // disable cartridge
-    Serial0.print("READ_CRC\r\n"); // send command to read cartridge crc
-    Serial.print("READ_CRC\r\n");  // send command to read cartridge crc
-    delay(250);
+    // Tell Pico to read the cartridge and compute its MD5
+    Serial0.print("READ_CRC\r\n");
+    Serial.print("READ_CRC\r\n");
     state = 1;
-
-    
-    // TEST - FORCING TETRIS
-    // md5 = "084f1e457749cdec86183189bd88ce69";
-
-    // TEST - FORCING ZELDA LINKS AWAKENING
-    // md5 = "5bc0913d533000522c7c9cac1ef6f97f";
-
-    // TEST - FORCING SUPER MARIO LAND
-    md5 = "c6cfb6cb982ac886faa83a1f0e597dc8";
-
-    // TEST - SEND MD5 TO PICO
-    Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-    Serial.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-    state = 2;
   }
   if (state == 2)
   {
-    digitalWrite(MUX, HIGH); // enable cartridge
+    print_line("Cartridge identified!", 1, 1);
+    print_line(md5.c_str(), 2, 1);
+    digitalWrite(MUX, HIGH); // enable cartridge / allow console power-on
     Serial0.print("START_WATCH\r\n");
     Serial.print("START_WATCH\r\n");
     state = 3;
@@ -1229,6 +1213,26 @@ void loop()
           }
           Serial0.print("MUX_SET\r\n");
           Serial.print("MUX_SET\r\n");
+        }
+      }
+      else if (command.startsWith("CART_MD5="))
+      {
+        // Pico computed the MD5 directly from the cartridge ROM
+        if (state != 1)
+        {
+          Serial0.print("COMMAND_IGNORED_WRONG_STATE\r\n");
+          Serial.print("COMMAND_IGNORED_WRONG_STATE\r\n");
+        }
+        else
+        {
+          md5 = command.substring(9);
+          md5.trim();
+          Serial.print("CART_MD5=" + md5 + "\r\n");
+          // Send confirmation back (Pico already has the MD5 but this
+          // maintains protocol compatibility with CRC_FOUND_MD5 handler)
+          Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");
+          Serial.print("CRC_FOUND_MD5=" + md5 + "\r\n");
+          state = 2;
         }
       }
       else if (command.startsWith("READ_CRC="))
