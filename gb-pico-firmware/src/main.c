@@ -528,7 +528,13 @@ int main()
                 command = serial_buffer;
 
                 // printf("CMD=%s\r\n", command);
-                if (prefix("RESP=", command))
+                if (prefix("SYNC", command) && !prefix("SYNC_ACK", command))
+                {
+                    printf("L:SYNC\n");
+                    uart_puts(UART_ID, "SYNC_ACK\r\n");
+                    printf("SYNC_ACK sent\n");
+                }
+                else if (prefix("RESP=", command))
                 {
                     printf("L:RESP\n");
                     request_ongoing -= 1;
