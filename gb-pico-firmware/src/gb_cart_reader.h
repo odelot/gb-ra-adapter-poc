@@ -49,17 +49,18 @@ typedef struct {
 /* ---- Public API ------------------------------------------------------ */
 
 /*
- * Read the full cartridge ROM and compute its MD5 hash.
+ * Identify a Game Boy cartridge by CRC32 fingerprint.
  *
- * Configures GPIO for active driving, reads the cart header, walks all
- * ROM banks with MBC bank‑switching, streams data through an incremental
- * MD5 computation, then restores GPIO for PIO snooping.
+ * Reads 512 bytes at 0x0000 and 512 bytes at 0x4000 (bank 1 is always
+ * mapped at reset — no bank switching needed), computes CRC32 of the
+ * combined 1024 bytes, then restores GPIO for PIO snooping.
  *
- *   md5_out  — buffer of at least 33 bytes (32 hex chars + NUL)
+ *   crc32_out  — buffer of at least 9 bytes (8 hex chars + NUL)
  *   header_out — optional; if non‑NULL, filled with parsed header info
  *
- * Returns true on success.
+ * Returns true on success.  The CRC32 is sent to the ESP32 which looks
+ * up the corresponding MD5 in a pre-computed table (NES adapter pattern).
  */
-bool cart_identify(char *md5_out, gb_cart_header_t *header_out);
+bool cart_identify(char *crc32_out, gb_cart_header_t *header_out);
 
 #endif /* GB_CART_READER_H */

@@ -32,7 +32,7 @@ uint32_t crcEnd = 0xFFFFFFFF;
  */
 
 uint8_t state = 0;
-int nes_reseted = 0;
+int gb_reseted = 0;
 char md5[33];
 uint8_t request_ongoing = 0;
 uint32_t last_request = 0;
@@ -283,7 +283,7 @@ static void server_call(const rc_api_request_t *request,
 #include <malloc.h>
 
 const char pico_version_command[] = "PICO_FIRMWARE_VERSION=0.7\r\n";
-const char nes_reseted_command[] = "NES_RESETED\r\n";
+const char gb_reseted_command[] = "GB_RESETED\r\n";
 const char buffer_overflow_command[] = "BUFFER_OVERFLOW\r\n";
 
 uint64_t last_frame_processed = 0;
@@ -442,10 +442,11 @@ int main()
             gb_cart_header_t cart_header;
             if (cart_identify(md5, &cart_header)) {
                 char cmd[64];
-                sprintf(cmd, "CART_MD5=%s\r\n", md5);
+                sprintf(cmd, "READ_CRC=%s\r\n", md5);
                 uart_puts(UART_ID, cmd);
-                printf("CART_MD5=%s\n", md5);
-                state = 2;
+                printf("READ_CRC=%s\n", md5);
+                /* Wait for ESP32 to respond with CRC_FOUND_MD5=<md5> which sets state=2 */
+                state = 0;
             } else {
                 uart_puts(UART_ID, "CRC_NOT_FOUND\r\n");
                 printf("CART: identification failed\n");
@@ -471,10 +472,10 @@ int main()
                     printf("EMU: VBlank #%u\n", (unsigned)vb);
                 }
 
-                if (nes_reseted == 0)
+                if (gb_reseted == 0)
                 {
-                    nes_reseted = 1;
-                    uart_puts(UART_ID, nes_reseted_command);
+                    gb_reseted = 1;
+                    uart_puts(UART_ID, gb_reseted_command);
                 }
 
                 rc_client_do_frame(g_client);
@@ -591,6 +592,7 @@ int main()
                     strncpy(md5, md5_ptr, 32);
                     md5[32] = '\0';
                     printf("MD5=%s\r\n", md5);
+                    state = 2;
                 }
                 else if (prefix("RESET", command)) // RESET
                 {
@@ -599,7 +601,7 @@ int main()
                     printf("pll_sys  = %dkHz\n", f_pll_sys);
                     fifo_init(&achievements_fifo);
                     state = 0;
-                    nes_reseted = 0;
+                    gb_reseted = 0;
                     memset(md5, '\0', 33);
                     crcBegin = 0xFFFFFFFF;
                     // Note: Core 1 (emulator) will be stopped on next multicore_launch_core1

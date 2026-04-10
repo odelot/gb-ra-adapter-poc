@@ -2,7 +2,8 @@
  * GB Cart Reader — Implementation
  *
  * Reads a Game Boy cartridge directly from the Pico (console is OFF).
- * Based on the cartreader project's GB.ino read routines.
+ * Reads the first 512 bytes at 0x0000, computes CRC32, and returns it
+ * as an 8-char hex string for lookup on the ESP32 side.
  */
 
 #include "gb_cart_reader.h"
@@ -13,15 +14,24 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 
-/* MD5 from rcheevos (already compiled into the binary) */
-#include "rhash/md5.h"
-
 /* ================================================================
  *  Internal helpers
  * ================================================================ */
 
-/* 512-byte chunk buffer for streaming into MD5 */
-static uint8_t chunk_buf[512];
+/* Standard CRC32 (ISO 3309 / PKZIP polynomial 0xEDB88320) */
+static uint32_t crc32_compute(const uint8_t *data, int len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+/* 512-byte sample from 0x0000 */
+static uint8_t sample_buf[512];
 
 /* ---- GPIO configuration --------------------------------------------- */
 
@@ -197,91 +207,20 @@ static bool cart_read_header(gb_cart_header_t *hdr)
     else
         hdr->rom_banks = 2;  /* unknown / fallback */
 
-    printf("CART: title='%s'  type=0x%02X  rom_banks=%u  rom_size_code=0x%02X\n",
-           hdr->title, hdr->cart_type, hdr->rom_banks, hdr->rom_size_code);
-
     return true;
-}
-
-/* ---- MBC bank switching --------------------------------------------- */
-
-/*
- * Select the given ROM bank in the 0x4000‑0x7FFF window.
- * Mirrors the cartreader logic for each MBC family.
- */
-static void set_rom_bank(uint8_t cart_type, uint16_t bank)
-{
-    switch (cart_type) {
-
-    /* ---- No MBC (ROM only) ---- */
-    case 0x00:
-    case 0x08:
-    case 0x09:
-        break;
-
-    /* ---- MBC1 ---- */
-    case 0x01:
-    case 0x02:
-    case 0x03:
-        cart_write_byte(0x6000, 0x00);              /* ROM banking mode  */
-        cart_write_byte(0x4000, (bank >> 5) & 0x03);/* upper 2 bits      */
-        cart_write_byte(0x2000, bank & 0x1F);       /* lower 5 bits      */
-        if ((bank & 0x1F) == 0) {
-            /* MBC1 quirk: bank 0 maps to bank 1 */
-            cart_write_byte(0x2000, 0x01);
-        }
-        break;
-
-    /* ---- MBC2 ---- */
-    case 0x05:
-    case 0x06:
-        cart_write_byte(0x2100, bank & 0x0F);
-        break;
-
-    /* ---- MBC3 ---- */
-    case 0x0F:
-    case 0x10:
-    case 0x11:
-    case 0x12:
-    case 0x13:
-        cart_write_byte(0x2100, bank & 0x7F);
-        if ((bank & 0x7F) == 0)
-            cart_write_byte(0x2100, 0x01);
-        break;
-
-    /* ---- MBC5 ---- */
-    case 0x19:
-    case 0x1A:
-    case 0x1B:
-    case 0x1C:
-    case 0x1D:
-    case 0x1E:
-        cart_write_byte(0x2000, bank & 0xFF);
-        cart_write_byte(0x3000, (bank >> 8) & 0x01);
-        break;
-
-    /* ---- MBC6 (half-banks, rare) ---- */
-    case 0x20:
-        cart_write_byte(0x2000, bank & 0xFF);
-        cart_write_byte(0x3000, bank & 0xFF);
-        break;
-
-    /* ---- Fallback: try MBC5-style (covers most HuC / unusual types) ---- */
-    default:
-        cart_write_byte(0x2000, bank & 0xFF);
-        cart_write_byte(0x3000, (bank >> 8) & 0x01);
-        break;
-    }
 }
 
 /* ================================================================
  *  Public: cart_identify
  * ================================================================ */
 
-bool cart_identify(char *md5_out, gb_cart_header_t *header_out)
+/*
+ * Read the first 512 bytes at 0x0000, compute CRC32, and return it
+ * as an 8-char hex string in crc32_out (buffer must be >= 9 bytes).
+ */
+bool cart_identify(char *crc32_out, gb_cart_header_t *header_out)
 {
     gb_cart_header_t hdr;
-    md5_state_t md5_state;
 
     printf("CART: starting cartridge identification\n");
 
@@ -295,40 +234,20 @@ bool cart_identify(char *md5_out, gb_cart_header_t *header_out)
     if (header_out)
         *header_out = hdr;
 
-    md5_init(&md5_state);
+    /* ----- Sample first 512 bytes at 0x0000 ----- */
+    for (int i = 0; i < 512; i++)
+        sample_buf[i] = cart_read_byte((uint16_t)i);
 
-    /* ----- Bank 0: 0x0000 – 0x3FFF (always mapped) ----- */
-    printf("CART: reading bank 0/%-u\n", hdr.rom_banks);
-    for (uint16_t addr = 0x0000; addr < 0x4000; addr += 512) {
-        for (int i = 0; i < 512; i++)
-            chunk_buf[i] = cart_read_byte(addr + (uint16_t)i);
-        md5_append(&md5_state, chunk_buf, 512);
-    }
-
-    /* ----- Banks 1 .. N-1: 0x4000 – 0x7FFF (bank‑switched) ----- */
-    for (uint16_t bank = 1; bank < hdr.rom_banks; bank++) {
-        if ((bank & 0x0F) == 0)
-            printf("CART: reading bank %u/%u\n", bank, hdr.rom_banks);
-
-        set_rom_bank(hdr.cart_type, bank);
-
-        for (uint16_t addr = 0x4000; addr < 0x8000; addr += 512) {
-            for (int i = 0; i < 512; i++)
-                chunk_buf[i] = cart_read_byte(addr + (uint16_t)i);
-            md5_append(&md5_state, chunk_buf, 512);
-        }
-    }
-
-    /* ----- Finalise MD5 ----- */
-    md5_byte_t digest[16];
-    md5_finish(&md5_state, digest);
-
-    for (int i = 0; i < 16; i++)
-        sprintf(md5_out + i * 2, "%02x", digest[i]);
-    md5_out[32] = '\0';
-
-    printf("CART: identification complete — MD5=%s\n", md5_out);
+    /* ----- CRC32 of 512 bytes ----- */
+    uint32_t crc = crc32_compute(sample_buf, 512);
+    sprintf(crc32_out, "%08lx", (unsigned long)crc);
 
     cart_gpio_restore_for_pio();
+
+    /* Diagnostics — only printed AFTER GPIO restored */
+    printf("CART: title='%s'  type=0x%02X  rom_banks=%u\n",
+           hdr.title, hdr.cart_type, hdr.rom_banks);
+    printf("CART: CRC32=%s\n", crc32_out);
+
     return true;
 }
