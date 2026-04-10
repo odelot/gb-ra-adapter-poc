@@ -1,314 +1,159 @@
-// #include "Arduino.h"
+/**********************************************************************************
+                    GB RA Adapter - ESP32 Firmware
 
-#include <WiFiManager.h>
-#include <EEPROM.h>
-#include <ArduinoJson.h>
-#include <JsonStreamingParser.h>
-#include <PNGdec.h>
-#include <StreamString.h>
+   This project is the ESP32 firmware for the GB RA Adapter, a device that connects
+   to an GB console and enables users to connect to the RetroAchievements server to
+   unlock achievements in games played on original hardware.
 
-#include <WiFi.h>
-#include <HTTPClient.h>
+   The ESP32 provides Internet connectivity to the GB and also manages a TFT screen
+   to display unlocked achievements, along with a buzzer for sound effects. It stores
+   Wi-Fi and RA credentials in EEPROM and allows users to configure settings via a
+   smartphone connected to the ESP32's access point. Users can reset the configuration
+   by holding the reset button for 5 seconds during startup. Additionally, it utilizes
+   LittleFS to store a CRC32-to-MD5 hash table (for cartridge identification) and game
+   images. The firmware communicates with a Raspberry Pi Pico through Serial0 to retrieve
+   the game CRC, send HTTP requests to RetroAchievements, and forward HTTP responses.
+   Finally, it orchestrates the opening and closing of the bus between the GB and the
+   cartridge by controlling analog switches.
 
-#include "SPI.h"
-#include <TFT_eSPI.h>
+   Date:             2026-03-14
+   Version:          1.2
+   By odelot
 
-#include "HardwareSerial.h"
+   Arduino IDE ESP32 Boards: v3.0.7
 
-// Include LittleFS
-#include <FS.h>
-#include "LittleFS.h"
-#define FileSys LittleFS
+   Libs used:
+   WifiManager: https://github.com/tzapu/WiFiManager v2.0.17
+   PNGdec: https://github.com/bitbank2/PNGdec v1.1.2
+   TFT_eSPI lib: https://github.com/Bodmer/TFT_eSPI v2.5.43
+   ESP Async WebServer: https://github.com/ESP32Async/ESPAsyncWebServer v.3.7.6
+   Async TCP: https://github.com/ESP32Async/AsyncTCP v3.4.0
 
-#include <time.h>
+   Compiled with Arduino IDE 2.3.4
 
-#define DEBUG 0
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
 
-#define EEPROM_SIZE 2048
-#define EEPROM_ID_1 142
-#define EEPROM_ID_2 208
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITGBS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
 
-#define MUX 3
-#define MUX_ENABLE_BUS HIGH
-#define MUX_DISABLE_BUS LOW
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#define FORMAT_LITTLEFS_IF_FAILED true
+**********************************************************************************/
 
-// send serial data into chunks with a delay
-#define CHUNK_SIZE 32
-#define TX_DELAY_MS 5
+/*********************************************************************************
+* FEATURE FLAGS
+**********************************************************************************/
 
-/** 
- * defines to use a lambda function to shrink  the JSON response with the list of achievements
+#define ENABLE_RESET 1
+
+/**
+ * defines to use a aws lambda function to shrink the JSON response with the list of achievements
  * remember: you need to deploy the lambda and inform its URL
  */
 
- #define ENABLE_SHRINK_LAMBDA 0 // 0 - disable / 1 - enable
- #define SHRINK_LAMBDA_URL "https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/default/NES_RA_ADAPTER?"
+#define ENABLE_SHRINK_LAMBDA 0 // 0 - disable / 1 - enable
+#define SHRINK_LAMBDA_URL "https://xxxxxxxxxx.execute-api.us-east-1.amazonaws.com/default/GB_RA_ADAPTER?"
 
-/*
- * FIFO for achievements the user won
- */
-
-#define FIFO_SIZE 5
-
-typedef struct
-{
-  uint32_t id;
-  String title;
-  String url;
-} achievements_t;
-
-typedef struct
-{
-  achievements_t buffer[FIFO_SIZE];
-  int head;
-  int tail;
-  int count;
-} FIFO_t;
-
-// #define MUX_ENABLE_BUS LOW
-// #define MUX_DISABLE_BUS HIGH
-
-#define MAX_IMAGE_WIDTH 240 // Adjust for your images
-PNG png;                    // PNG decoder instance
-
-int16_t xpos = 0;
-int16_t ypos = 0;
-
-TFT_eSPI tft = TFT_eSPI(); // Invoke custom library
-
-String base_url = "https://retroachievements.org/dorequest.php?";
-String ra_user_token = "";
-
-int state = 255; // TODO: change to enum
-
-String buffer = "";
-String md5 = "";
-StaticJsonDocument<512> jsonDoc;
-
-/*
- * network client
- */
-
-NetworkClientSecure client;
-NetworkClient clientDebug;
-HTTPClient https;
-
-/*
-
-CRC MD5
-
+/**
+ enable internal web app (comment to disable)
 */
 
-// Look up the MD5 for a given CRC32 in /games.txt (format: XXXXXXXX=md5)
-String getMD5(String crc)
-{
-  const char *filePath = "/games.txt";
+#define ENABLE_INTERNAL_WEB_APP_SUPPORT
 
-  File file = LittleFS.open(filePath, "r");
-  if (!file)
-  {
-    Serial.println("Error opening file");
-    return "";
-  }
+/**
+* enable LCD (comment to disable)
+*/
+#define ENABLE_LCD
 
-  String line;
-  while (file.available())
-  {
-    line = file.readStringUntil('\n');
-    int indexAfterEqualSign = line.indexOf('=');
-    if (indexAfterEqualSign == 8) // CRC32 is always 8 hex chars
-    {
-      String fileCrc = line.substring(0, 8);
-      String fileMd5 = line.substring(9); // skip '='
-      fileMd5.trim();
-      if (fileCrc.equalsIgnoreCase(crc))
-      {
-        file.close();
-        return fileMd5;
-      }
-    }
-  }
+/**
+* flip screen upside down
+*/
+#define FLIP_SCREEN
 
-  file.close();
-  return "";
-}
+#include <WiFiManager.h>
+#include <EEPROM.h>
 
-/*
- * json
+#include <StreamString.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include "HardwareSerial.h"
+#include "LittleFS.h"
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+#include <driver/uart.h>
+#include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <Ticker.h>
+#include "CharBufferStream.h"
+
+#ifdef ENABLE_LCD
+  #include <PNGdec.h>
+  #include "SPI.h"
+  #include <TFT_eSPI.h>
+#endif
+
+#define VERSION "1.1"
+
+/**
+ * defines for the LittleFS
  */
+#define FileSys LittleFS
+#define FORMAT_LITTLEFS_IF_FAILED true
 
-void remove_space_new_lines_in_json(String &json)
-{
-  bool insideQuotes = false;
-  int writeIndex = 0;
-
-  for (int readIndex = 0; readIndex < json.length(); readIndex++)
-  {
-    char c = json[readIndex];
-
-    if (c == '"')
-    {
-      if (json[readIndex - 1] != '\\')
-        insideQuotes = !insideQuotes;
-    }
-
-    if (insideQuotes || (c != ' ' && c != '\n' && c != '\r' && c != '\t'))
-    {
-      json[writeIndex++] = c;
-    }
-  }
-
-  json.remove(writeIndex); // Reduz o tamanho da string sem cópias extras
-}
-
-void remove_not_nested_json_field(String &json, const String &field_to_remove)
-{
-  remove_space_new_lines_in_json(json);
-
-  bool insideQuotes = false;
-  bool insideArray = false;
-  bool skipField = false;
-  int fieldLen = field_to_remove.length();
-  int readIndex = 0, writeIndex = 0, skipInit = 0;
-
-  while (readIndex < json.length())
-  {
-    char c = json[readIndex];
-
-    if (c == '"')
-    {
-      // if (json[readIndex - 1] != '\\')
-      insideQuotes = !insideQuotes;
-    }
-
-    if (c == '[' && skipField)
-    {
-      insideArray = true;
-    }
-    if (c == ']' && skipField)
-    {
-      insideArray = false;
-    }
-
-    if (insideQuotes && json.substring(readIndex + 1, readIndex + 1 + fieldLen) == field_to_remove && json[readIndex + fieldLen + 1] == '"')
-    {
-      skipField = true;
-      skipInit = readIndex;
-    }
-
-    if (!skipField)
-    {
-      json[writeIndex++] = c;
-    }
-
-    if (skipField && json[readIndex + 1] == '}')
-    {
-      skipField = false; // Fim do campo a ser removido
-      if (json[skipInit - 1] == ',')
-      {
-        writeIndex--; // Remove a vírgula que sobrou
-      }
-    }
-    else if (skipField && json[readIndex] == ',' && (insideArray == false && insideQuotes == false))
-    {
-      skipField = false; // Fim do campo a ser removido
-    }
-
-    readIndex++;
-  }
-
-  json.remove(writeIndex);
-}
-
-void clean_json_field_str_value(String &json, const String &field_to_remove)
-{
-  remove_space_new_lines_in_json(json);
-
-  bool insideQuotes = false;
-  bool insideArray = false;
-  bool skipField = false;
-  int fieldLen = field_to_remove.length();
-  int readIndex = 0, writeIndex = 0, skipInit = 0;
-  bool removeNextStr = false;
-  while (readIndex < json.length())
-  {
-    char c = json[readIndex];
-
-    if (c == '"')
-    {
-      if (json[readIndex - 1] != '\\')
-      {
-        insideQuotes = !insideQuotes;
-        if (insideQuotes && removeNextStr)
-        {
-          skipField = true;
-          json[writeIndex++] = '"';
-        }
-        if (!insideQuotes && removeNextStr && readIndex > skipInit)
-        {
-          removeNextStr = false;
-          skipField = false;
-        }
-      }
-    }
-
-    if (insideQuotes && json.substring(readIndex + 1, readIndex + 1 + fieldLen) == field_to_remove && json[readIndex + fieldLen + 1] == '"')
-    {
-      removeNextStr = true;
-      skipInit = readIndex + fieldLen + 2;
-    }
-
-    if (!skipField)
-    {
-      json[writeIndex++] = c;
-    }
-    readIndex++;
-  }
-
-  json.remove(writeIndex);
-}
-
-/*
- * png
+/**
+ * defines for the EEPROM
+ * Real usage: ~100 bytes (2 ID + 1 flag + 1 user_len + ~32 user + 1 pass_len + ~64 pass)
  */
+#define EEPROM_SIZE 256
+#define EEPROM_ID_1 142
+#define EEPROM_ID_2 208
 
-File pngfile;
+/**
+ * defines for the analog switch
+ */
+#define ANALOG_SWITCH_PIN 3
+#define ANALOG_SWITCH_ENABLE_BUS HIGH
+#define ANALOG_SWITCH_DISABLE_BUS LOW
 
-void *pngOpen(const char *filename, int32_t *size)
-{
-  Serial.printf("Attempting to open %s\n", filename);
-  pngfile = FileSys.open(filename, "r");
-  *size = pngfile.size();
-  return &pngfile;
-}
+/**
+ * defines for sending big serial data into chunks with a delay
+ */
+#define SERIAL_COMM_CHUNK_SIZE 32
+#define SERIAL_COMM_TX_DELAY_MS 5
 
-void pngClose(void *handle)
-{
-  File pngfile = *((File *)handle);
-  if (pngfile)
-    pngfile.close();
-}
+#define SERIAL_MAX_PICO_BUFFER 32768
+/**
+ * defines for the fifo used to store achievements to be showed on screen
+ */
+#define ACHIEVEMENTS_FIFO_SIZE 5
 
-int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length)
-{
-  if (!pngfile)
-    return 0;
-  page = page; // Avoid warning
-  return pngfile.read(buffer, length);
-}
+/**
+ * defines for the png decoder
+ */
+#define MAX_IMAGE_WIDTH 240
 
-int32_t pngSeek(PNGFILE *page, int32_t position)
-{
-  if (!pngfile)
-    return 0;
-  page = page; // Avoid warning
-  return pngfile.seek(position);
-}
+/**
+ * defines for the LCD
+ */
+#define LCD_BRIGHTGBS_PIN 7
 
-/*
- * buzzer
+/**
+ * defines for status led
+ */
+#define LED_STATUS_RED_PIN 6
+#define LED_STATUS_GREEN_PIN 5
+
+/**
+ * defines for the buzzer
  */
 
 #define NOTE_CS6 1109
@@ -326,54 +171,18 @@ int32_t pngSeek(PNGFILE *page, int32_t position)
 #define NOTE_E7 2637
 #define NOTE_F7 2794
 #define NOTE_G7 3136
+#define NOTE_B4   494
+#define NOTE_FS5  740
+#define NOTE_C5  523
+#define NOTE_GS4 415
+#define NOTE_AS4 466
 
-int snd_notes_achievement_unlocked[] = {
-    NOTE_D5, NOTE_D5, NOTE_CS6, NOTE_D6};
-
-int snd_velocity_achievement_unlocked[] = {
-    52,
-    37,
-    83,
-    74,
-};
-
-int snd_notes_duration_achievement_unlocked[] = {
-    2,
-    4,
-    3,
-    12,
-};
 
 #define SOUND_PIN 10
 
-/*
- * rcheevos
+/**
+ * defines for the reset button
  */
-
-// typedef struct
-// {
-//   rc_client_server_callback_t callback;
-//   void *callback_data;
-// } async_callback_data;
-
-// rc_client_t *g_client = NULL;
-// static void *g_callback_userdata = &g_client; /* dummy data */
-// char rcheevos_userdata[16];
-// async_callback_data async_data;
-
-uint16_t *unique_memory_addresses = NULL;
-uint16_t unique_memory_addresses_count = 0;
-uint8_t *memory_data = NULL;
-
-String gameName = "not identified";
-String gameId = "0";
-bool comebackToTitleScreen = false;
-
-bool alreadyShowedTitleScreen = false;
-
-long comebackToTitleScreenTS;
-
-WiFiManager wm;
 
 // time that reset button should be pressed to kick off reset operation
 #define RESET_PRESSED_TIME 5000L
@@ -381,51 +190,841 @@ WiFiManager wm;
 // pin to the reset button
 #define RESET_PIN 8
 
-#define ENABLE_RESET 0
+// types for http request
+typedef enum HttpRequestMethod
+{
+  GET = 0,
+  POST = 1
+};
 
-void fifo_init(FIFO_t *fifo)
+typedef enum HttpRequestResult
+{
+  HTTP_SUCCESS = 0,
+  HTTP_ERR_NO_WIFI = -1,
+  HTTP_ERR_REQUEST_FAILED = -2,
+  HTTP_ERR_HTTP_4XX = -3,
+  HTTP_ERR_TIMEOUT = -4,
+  HTTP_ERR_REPONSE_TOO_BIG = -5,
+};
+
+// Device state machine states
+typedef enum DeviceState {
+  STATE_IDENTIFY_CARTRIDGE = 0,
+  STATE_WAITING_CRC = 1,
+  STATE_CRC_FOUND = 2,
+  STATE_WATCHING = 3,
+  STATE_IDLE = 128,
+  STATE_ERROR_CONNECTIVITY = 198,
+  STATE_ERROR_RESPONSE_TOO_BIG = 199,
+  STATE_ERROR_LOGIN_FAILED = 253,
+  STATE_ERROR_CARTRIDGE_NOT_FOUND = 254,
+  STATE_UNINITIALIZED = 255
+} DeviceState;
+
+// Check if state is an error state
+inline bool isErrorState(DeviceState s) {
+  return s >= STATE_ERROR_CONNECTIVITY;
+}
+
+// Get error message for a given state
+const char* getStateErrorMessage(DeviceState s) {
+  switch(s) {
+    case STATE_ERROR_CONNECTIVITY:
+      return "Connectivity Error";
+    case STATE_ERROR_RESPONSE_TOO_BIG:
+      return "RA response is too big";
+    case STATE_ERROR_LOGIN_FAILED:
+      return "Could not log in RA!";
+    case STATE_ERROR_CARTRIDGE_NOT_FOUND:
+      return "Cartridge not identified";
+    default:
+      return "Unknown error";
+  }
+}
+
+// type to store the achievements to be showed on screen
+typedef struct
+{
+  uint32_t id;
+  String title;
+  String url;
+} achievements_t;
+
+// type to store the achievement fifo
+typedef struct
+{
+  achievements_t buffer[ACHIEVEMENTS_FIFO_SIZE];
+  int head;
+  int tail;
+  int count;
+} achievements_FIFO_t;
+
+// types for LED control
+
+enum LedMode {
+  LED_OFF,
+  LED_ON,
+  LED_BLINK_SLOW,
+  LED_BLINK_MEDIUM,
+  LED_BLINK_FAST
+};
+
+enum LedColor {
+  LED_RED,
+  LED_GREEN,
+  LED_YELLOW  
+};
+
+struct Led {
+  uint8_t pin;
+  LedMode mode;
+  bool state; // HIGH ou LOW atual
+  Ticker ticker;
+};
+
+// Forward declarations for functions using custom types
+// (needed because Arduino IDE auto-generates prototypes before type definitions)
+void updateLed(Led* led);
+void configureTicker(Led* led);
+void setSemaphore(LedMode mode, LedColor color);
+void fifo_init(achievements_FIFO_t *fifo);
+bool fifo_is_empty(achievements_FIFO_t *fifo);
+bool fifo_is_full(achievements_FIFO_t *fifo);
+bool fifo_enqueue(achievements_FIFO_t *fifo, achievements_t value);
+bool fifo_dequeue(achievements_FIFO_t *fifo, achievements_t *value);
+void show_achievement(achievements_t achievement);
+
+
+// global variables for LED control
+Led ledRed   = {LED_STATUS_RED_PIN, LED_OFF, false, Ticker()};
+Led ledGreen = {LED_STATUS_GREEN_PIN, LED_OFF, false, Ticker()};
+
+
+#ifdef ENABLE_LCD
+// global variables for the PNG decoder - pointer to save memory during patch download
+PNG* png = nullptr;
+int16_t x_pos = 0;
+int16_t y_pos = 0;
+File png_file;
+
+// global variables for the TFT screen
+TFT_eSPI tft = TFT_eSPI();
+#endif
+
+// global variables for the achievements fifo
+achievements_FIFO_t achievements_fifo;
+
+// custom html and parameters for the configuration portal
+const char head[] PROGMEM = "<style>#l,#i,#z{text-align:center}#i,#z{margin:15px auto}button{background-color:#0000FF;}#l{margin:0 auto;width:100%; font-size: 28px;}p{margin-bottom:-5px}[type='checkbox']{height: 20px;width: 20px;}</style><script>var w=window,d=document,e=\"password\";function cc(){z=gE(this.w);z.type!=e?z.type=e:z.type='text';z.focus();}function iB(a,b,c){a.insertBefore(b,c)}function gE(a){return d.getElementById(a)}function cE(a){return d.createElement(a)};\"http://192.168.1.1/\"==w.location.href&&(w.location.href+=\"wifi\");</script>\0";
+const char html_p1[] PROGMEM = "<p id='z' style='width: 80%;'>Enter the RetroAchievements credentials below:</p>\0";
+const char html_p2[] PROGMEM = "<p>&#8226; RetroAchievements user name: </p>\0";
+const char html_p3[] PROGMEM = "<p>&#8226; RetroAchievements user password: </p>\0";
+const char html_s[] PROGMEM = "<script>gE(\"s\").required=!0;l=cE(\"div\");l.innerHTML=\"GB RetroAchievements Adapter\",l.id=\"l\";m=d.body.childNodes[0];iB(m,l,m.childNodes[0]);p=cE(\"p\");p.id=\"i\",p.innerHTML=\"Choose the network you want to connect with:\",iB(m,p,m.childNodes[1]),a=d.createTextNode(\" show \"+e),sp=(s=d.getElementById(\"up\").nextSibling).parentNode,(c1=d.createElement(\"input\")).type=\"checkbox\",c1.onclick=cc,c1.w=\"up\",iB(sp,c1,s),iB(sp,a,s);</script>\0";
+
+// ws variables
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+AsyncWebServer* server = nullptr;
+AsyncWebSocket* ws = nullptr;
+uint32_t last_ws_cleanup = millis();
+AsyncWebSocketClient *ws_client = NULL;
+bool websocket_initialized = false;
+#endif
+
+// global variables for the state machine
+DeviceState state = STATE_UNINITIALIZED;
+
+// URL base for RetroAchievements API
+const char* base_url = "https://retroachievements.org/dorequest.php?";
+
+// Achievement tracking for display
+uint16_t total_achievements = 0;
+uint16_t unlocked_achievements = 0;
+
+// global variables for storing states, timestamps and useful information
+String ra_user_token;
+
+// Buffer fixo para comunicação serial com o Pico (evita fragmentação de memória)
+// Reduzido para economizar RAM - comandos típicos são < 512 bytes
+#define SERIAL_BUFFER_SIZE 768
+char serial_buffer[SERIAL_BUFFER_SIZE];
+size_t serial_buffer_len = 0;
+
+// Flexible buffer for large HTTP responses 
+#define LARGE_BUFFER_SIZE 102400 // 100 KB 
+#define SMALL_BUFFER_SIZE 10240 // 10 KB
+CharBufferStream response;
+// HTTP client global to reuse SSL buffers (avoids fragmentation)
+NetworkClientSecure globalSecureClient;
+HTTPClient globalHttpClient;
+bool httpClientInitialized = false;
+
+// Cartridge MD5 - use fixed buffer instead of String to avoid fragmentation
+char md5_global[34] = {0};
+
+String game_name;
+String game_image;
+String game_id;
+String game_session;
+bool go_back_to_title_screen = false;
+bool already_showed_title_screen = false;
+long go_back_to_title_screen_timestamp;
+unsigned long last_wifi_status_update = 0;
+
+/**
+ * functions related to LED status and control
+ */
+
+// function called by the ticker to update the LED state
+void updateLed(Led* led) {
+  switch (led->mode) {
+    case LED_OFF:
+      led->state = false;
+      digitalWrite(led->pin, LOW);
+      break;
+
+    case LED_ON:
+      led->state = true;
+      digitalWrite(led->pin, HIGH);
+      break;
+
+    case LED_BLINK_SLOW:
+    case LED_BLINK_MEDIUM:
+    case LED_BLINK_FAST:
+      led->state = !led->state;
+      digitalWrite(led->pin, led->state);
+      break;
+  }
+}
+
+// configure the LED ticker based on the mode
+void configureTicker(Led* led) {
+  led->ticker.detach();  // Para evitar duplicatas
+
+  float interval = 0;
+
+  switch (led->mode) {
+    case LED_BLINK_SLOW:   interval = 0.9; break;
+    case LED_BLINK_MEDIUM: interval = 0.6; break;
+    case LED_BLINK_FAST:   interval = 0.3; break;
+    case LED_ON:
+    case LED_OFF:
+      updateLed(led);  // atualiza o estado imediatamente
+      return;
+  }
+
+  led->ticker.attach(interval, updateLed, led);
+}
+
+// set the LED mode and color
+void setSemaphore (LedMode mode, LedColor color) {
+  ledRed.mode = LED_OFF;
+  ledGreen.mode = LED_OFF;
+  switch (color) {
+    case LED_RED:
+      ledRed.mode = mode;
+      break;
+    case LED_GREEN:
+      ledGreen.mode = mode;      
+      break;
+    case LED_YELLOW:
+      ledRed.mode = mode;
+      ledGreen.mode = mode;
+      break;
+  }
+  configureTicker(&ledRed);
+  configureTicker(&ledGreen);
+}
+
+
+/**
+ * functions to identify the cartridge
+ */
+
+// look for the md5 hash in the crc to md5 hash table (games.txt)
+// first_bank is true if the crc is from the first bank of the cartridge,
+// otherwise it look for the crc from the last bank
+// Returns true if found, false otherwise. Result stored in md5_out buffer.
+bool get_MD5(const char* crc, char* md5_out, size_t md5_out_size)
+{
+  
+  md5_out[0] = '\0'; // Initialize empty
+  
+  if (strcmp(crc, "BD7BC39F") == 0)
+  {
+    Serial.println(F("CRC is 0xBD7BC39F - skipping"));
+    return false;
+  }
+  if (strcmp(crc, "B2AA7578") == 0)
+  {
+    Serial.println(F("CRC is 0xB2AA7578 - skipping"));
+    return false;
+  }
+
+  const char *filePath = "/games.txt";
+
+  File file = LittleFS.open(filePath, "r");
+  if (!file)
+  {
+    Serial.println(F("Error opening file"));
+    return false;
+  }
+
+  char line_buffer[56];   // max: 8 + 1 + 8 + 1 + 32 + 1 = 51 chars
+  char crc1_buffer[10];
+  char crc2_buffer[10];
+  char md5_buffer[34];
+  
+  // Convert input CRC to uppercase for case-insensitive comparison
+  char crc_upper[10];
+  strncpy(crc_upper, crc, sizeof(crc_upper) - 1);
+  crc_upper[sizeof(crc_upper) - 1] = '\0';
+  for (char* p = crc_upper; *p; p++) *p = toupper(*p);
+
+  while (file.available())
+  {
+    // Read line directly into fixed buffer
+    size_t len = file.readBytesUntil('\n', line_buffer, sizeof(line_buffer) - 1);
+    if (len == 0) continue;
+    line_buffer[len] = '\0';
+    
+    // Remove \r if present
+    if (len > 0 && line_buffer[len - 1] == '\r') {
+      line_buffer[len - 1] = '\0';
+      len--;
+    }
+
+    // Parse line: CRC1=MD5    
+    char* equals = strchr(line_buffer, '=');
+    
+    if (equals == NULL ) continue;
+    
+    // Extract CRC1 (before the equals)
+    size_t crc1_len = equals - line_buffer;
+    if (crc1_len >= sizeof(crc1_buffer)) continue;
+    memcpy(crc1_buffer, line_buffer, crc1_len);
+    crc1_buffer[crc1_len] = '\0';
+    
+    // Extract MD5 (after the equals)
+    size_t md5_len = strlen(equals + 1);
+    if (md5_len >= sizeof(md5_buffer)) continue;
+    strcpy(md5_buffer, equals + 1);
+    
+    // Convert to uppercase for comparison
+    for (char* p = crc1_buffer; *p; p++) *p = toupper(*p);
+    
+    // Compare
+    if (strcmp(crc1_buffer, crc_upper) == 0)
+    {
+      file.close();
+      // Copy result to output buffer
+      size_t copy_len = strlen(md5_buffer);
+      if (copy_len >= md5_out_size) copy_len = md5_out_size - 1;
+      memcpy(md5_out, md5_buffer, copy_len);
+      md5_out[copy_len] = '\0';
+      return true;
+    }
+  }
+
+  file.close();
+  return false;
+}
+// ============================================================================
+// JSON cleaning functions that operate directly on CharBufferStream (in-place)
+// They do not copy memory - they modify the original buffer
+// ============================================================================
+
+// Remove spaces, newlines, and tabs outside of strings (in-place on CharBufferStream)
+void remove_space_new_lines_buffer(CharBufferStream &buf)
+{
+  char* data = buf.data();
+  size_t len = buf.length();
+  bool inside_quotes = false;
+  size_t write_idx = 0;
+
+  for (size_t read_idx = 0; read_idx < len; read_idx++)
+  {
+    char c = data[read_idx];
+
+    if (c == '"' && (read_idx == 0 || data[read_idx - 1] != '\\')) {
+      inside_quotes = !inside_quotes;
+    }
+
+    if (inside_quotes || (c != ' ' && c != '\n' && c != '\r' && c != '\t')) {
+      data[write_idx++] = c;
+    }
+  }
+  buf.setLength(write_idx);
+}
+
+// Remove a complete JSON field (in-place on CharBufferStream)
+void remove_json_field_buffer(CharBufferStream &buf, const char* field_to_remove)
+{
+  remove_space_new_lines_buffer(buf);
+  
+  char* data = buf.data();
+  size_t len = buf.length();
+  size_t field_len = strlen(field_to_remove);
+  
+  bool inside_quotes = false;
+  bool inside_array = false;
+  bool skip_field = false;
+  size_t read_idx = 0, write_idx = 0, skip_init = 0;
+
+  while (read_idx < len)
+  {
+    char c = data[read_idx];
+
+    if (c == '"' && (read_idx == 0 || data[read_idx - 1] != '\\')) {
+      inside_quotes = !inside_quotes;
+    }
+
+    if (c == '[' && skip_field) inside_array = true;
+    if (c == ']' && skip_field) inside_array = false;
+
+    // Detect start of field to remove
+    if (inside_quotes && 
+        read_idx + 1 + field_len + 1 < len &&
+        strncmp(data + read_idx + 1, field_to_remove, field_len) == 0 &&
+        data[read_idx + field_len + 1] == '"')
+    {
+      skip_field = true;
+      skip_init = read_idx;
+    }
+
+    if (!skip_field) {
+      data[write_idx++] = c;
+    }
+
+    // End of field
+    if (skip_field && read_idx + 1 < len && data[read_idx + 1] == '}') {
+      skip_field = false;
+      if (skip_init > 0 && data[skip_init - 1] == ',') {
+        write_idx--;
+      }
+    }
+    else if (skip_field && data[read_idx] == ',' && !inside_array && !inside_quotes) {
+      skip_field = false;
+    }
+
+    read_idx++;
+  }
+  buf.setLength(write_idx);
+}
+
+// Clean the string value of a field - replace with "" (in-place on CharBufferStream)
+void clean_json_field_str_value_buffer(CharBufferStream &buf, const char* field_to_remove)
+{
+  remove_space_new_lines_buffer(buf);
+  
+  char* data = buf.data();
+  size_t len = buf.length();
+  size_t field_len = strlen(field_to_remove);
+  
+  bool inside_quotes = false;
+  bool skip_field = false;
+  bool remove_next_str = false;
+  size_t read_idx = 0, write_idx = 0, skip_init = 0;
+
+  while (read_idx < len)
+  {
+    char c = data[read_idx];
+
+    if (c == '"' && (read_idx == 0 || data[read_idx - 1] != '\\'))
+    {
+      inside_quotes = !inside_quotes;
+      if (inside_quotes && remove_next_str) {
+        skip_field = true;
+        data[write_idx++] = '"';
+      }
+      if (!inside_quotes && remove_next_str && read_idx > skip_init) {
+        remove_next_str = false;
+        skip_field = false;
+      }
+    }
+
+    if (inside_quotes &&
+        read_idx + 1 + field_len + 1 < len &&
+        strncmp(data + read_idx + 1, field_to_remove, field_len) == 0 &&
+        data[read_idx + field_len + 1] == '"')
+    {
+      remove_next_str = true;
+      skip_init = read_idx + field_len + 2;
+    }
+
+    if (!skip_field) {
+      data[write_idx++] = c;
+    }
+    read_idx++;
+  }
+  buf.setLength(write_idx);
+}
+
+// Clean the array value of a field - replace with [] (in-place on CharBufferStream)
+void clean_json_field_array_value_buffer(CharBufferStream &buf, const char* field_to_remove)
+{
+  remove_space_new_lines_buffer(buf);
+  
+  char* data = buf.data();
+  size_t len = buf.length();
+  size_t field_len = strlen(field_to_remove);
+  
+  bool inside_quotes = false;
+  bool skip_field = false;
+  bool remove_next_array = false;
+  int array_depth = 0;
+  size_t read_idx = 0, write_idx = 0;
+
+  while (read_idx < len)
+  {
+    char c = data[read_idx];
+
+    // Update quote state first (handling escaped quotes)
+    if (c == '"' && (read_idx == 0 || data[read_idx - 1] != '\\')) {
+      inside_quotes = !inside_quotes;
+    }
+
+    // Only process [ and ] when NOT inside quotes
+    if (!inside_quotes) {
+      if (c == '[') {
+        if (remove_next_array) {
+          if (array_depth == 0) {
+            skip_field = true;
+            data[write_idx++] = '[';
+          }
+          array_depth++;
+        }
+      }
+      if (c == ']') {
+        if (remove_next_array) {
+          array_depth--;
+          if (array_depth == 0) {
+            remove_next_array = false;
+            skip_field = false;
+          }
+        }
+      }
+    }
+
+    // Detect the field name to remove
+    if (inside_quotes &&
+        read_idx + 1 + field_len + 1 < len &&
+        strncmp(data + read_idx + 1, field_to_remove, field_len) == 0 &&
+        data[read_idx + field_len + 1] == '"')
+    {
+      remove_next_array = true;
+    }
+
+    if (!skip_field) {
+      data[write_idx++] = c;
+    }
+    read_idx++;
+  }
+  buf.setLength(write_idx);
+}
+
+// Remove achievements with flags 5 (unofficial) - in-place on CharBufferStream
+void remove_achievements_with_flags_5_buffer(CharBufferStream &buf)
+{
+  remove_space_new_lines_buffer(buf);
+  
+  char* data = buf.data();
+  int achvStart = buf.indexOf("\"Achievements\":[");
+  if (achvStart == -1) return;
+
+  int arrayStart = buf.indexOf("[", achvStart);
+  int arrayEnd = buf.indexOf("]", arrayStart);
+  if (arrayStart == -1 || arrayEnd == -1) return;
+
+  int objCount = 0;
+  int pos = arrayStart + 1;
+  
+  while (pos < arrayEnd)
+  {
+    int objStart = buf.indexOf("{", pos);
+    if (objStart == -1 || objStart > arrayEnd) break;
+
+    int objEnd = objStart;
+    int braces = 1;
+    bool inString = false;
+    while (braces > 0 && objEnd < arrayEnd) {
+      objEnd++;
+      char ch = data[objEnd];
+      if (ch == '"' && (objEnd == 0 || data[objEnd - 1] != '\\')) {
+        inString = !inString;
+      }
+      if (!inString) {
+        if (ch == '{') braces++;
+        else if (ch == '}') braces--;
+      }
+    }
+
+    if (objEnd >= arrayEnd) break;
+    objCount++;
+
+    // Search for "Flags":5 inside the object
+    bool hasFlags5 = false;
+    for (int i = objStart; i < objEnd - 8; i++) {
+      if (strncmp(data + i, "\"Flags\":5", 9) == 0) {
+        hasFlags5 = true;
+        break;
+      }
+    }
+
+    if (hasFlags5)
+    {
+      int removeStart = objStart;
+      while (removeStart > arrayStart && (data[removeStart - 1] == ' ' || data[removeStart - 1] == '\n'))
+        removeStart--;
+      if (data[removeStart - 1] == ',')
+        removeStart--;
+      if (objCount == 1 && objEnd + 1 < (int)buf.length() && data[objEnd + 1] == ',')
+        objEnd++;
+
+      buf.removeRange(removeStart, objEnd - removeStart + 1);
+      arrayEnd = buf.indexOf("]", arrayStart);
+      pos = removeStart;
+    }
+    else
+    {
+      pos = objEnd + 1;
+    }
+  }
+}
+
+// Helper: find closing quote handling escaped quotes
+int findClosingQuote(char* data, int start, int limit) {
+  for (int i = start; i < limit; i++) {
+    if (data[i] == '"' && (i == 0 || data[i - 1] != '\\')) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Remove achievements with very large MemAddr - in-place on CharBufferStream
+void remove_achievements_with_long_MemAddr_buffer(CharBufferStream &buf, uint32_t maxSize)
+{
+  char* data = buf.data();
+  int achievementsPos = buf.indexOf("\"Achievements\"");
+  if (achievementsPos == -1) return;
+
+  int arrayStart = buf.indexOf("[", achievementsPos);
+  int arrayEnd = buf.indexOf("]", arrayStart);
+  if (arrayStart == -1 || arrayEnd == -1) return;
+
+  int pos = arrayStart + 1;
+  
+  while (pos < arrayEnd)
+  {
+    int objStart = buf.indexOf("{", pos);
+    if (objStart == -1 || objStart >= arrayEnd) break;
+
+    int objEnd = objStart;
+    int braceCount = 1;
+    bool inString = false;
+    while (braceCount > 0 && objEnd + 1 < (int)buf.length()) {
+      objEnd++;
+      char ch = data[objEnd];
+      if (ch == '"' && (objEnd == 0 || data[objEnd - 1] != '\\')) {
+        inString = !inString;
+      }
+      if (!inString) {
+        if (ch == '{') braceCount++;
+        else if (ch == '}') braceCount--;
+      }
+    }
+
+    if (objEnd >= arrayEnd) break;
+
+    // Search for "MemAddr"
+    int memAddrPos = -1;
+    for (int i = objStart; i < objEnd - 8; i++) {
+      if (strncmp(data + i, "\"MemAddr\"", 9) == 0) {
+        memAddrPos = i;
+        break;
+      }
+    }
+
+    if (memAddrPos == -1) {
+      pos = objEnd + 1;
+      continue;
+    }
+
+    int valueStart = buf.indexOf("\"", memAddrPos + 9);
+    if (valueStart == -1 || valueStart > objEnd) {
+      pos = objEnd + 1;
+      continue;
+    }
+
+    int valueEnd = findClosingQuote(data, valueStart + 1, objEnd);
+    if (valueEnd == -1 || valueEnd > objEnd) {
+      pos = objEnd + 1;
+      continue;
+    }
+
+    int memAddrLength = valueEnd - valueStart - 1;
+    
+    if (memAddrLength > (int)maxSize)
+    {
+      int removeStart = objStart;
+      int removeEnd = objEnd + 1;
+
+      if (removeEnd < (int)buf.length() && data[removeEnd] == ',')
+        removeEnd++;
+      else if (removeStart > arrayStart + 1 && data[removeStart - 1] == ',')
+        removeStart--;
+
+      buf.removeRange(removeStart, removeEnd - removeStart);
+      arrayEnd -= (removeEnd - removeStart);
+      pos = removeStart;
+    }
+    else
+    {
+      pos = objEnd + 1;
+    }
+  }
+}
+
+
+void print_memory_stats(const char* label = "") {
+  Serial.println(F("=== MEMORY STATS ==="));
+  if (label[0] != '\0') { Serial.print(F("Label: ")); Serial.println(label); }
+  Serial.print(F("Free heap: ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" bytes"));
+  Serial.print(F("Largest block: ")); Serial.print(ESP.getMaxAllocHeap()); Serial.println(F(" bytes"));
+  Serial.print(F("Min free heap: ")); Serial.print(ESP.getMinFreeHeap()); Serial.println(F(" bytes"));
+  Serial.print(F("Buffer capacity: ")); Serial.print(response.capacity()); Serial.println(F(" bytes"));
+  Serial.print(F("Buffer length: ")); Serial.print(response.length()); Serial.println(F(" bytes"));
+  Serial.println(F("===================="));
+}
+
+
+#ifdef ENABLE_LCD
+/*
+ * functions related to the png decoder and file management
+ */
+
+// open a png file from the LittleFS
+void *png_open(const char *file_name, int32_t *size)
+{
+  Serial.print(F("Attempting to open ")); Serial.println(file_name);
+  png_file = FileSys.open(file_name, "r");
+  *size = png_file.size();
+  return &png_file;
+}
+
+// close a png file from the LittleFS
+void png_close(void *handle)
+{
+  File png_file = *((File *)handle);
+  if (png_file)
+    png_file.close();
+}
+
+// read a png file from the LittleFS
+int32_t png_read(PNGFILE *page, uint8_t *buffer, int32_t length)
+{
+  if (!png_file)
+    return 0;
+  page = page; // Avoid warning
+  return png_file.read(buffer, length);
+}
+
+// seek a position in a png file from the LittleFS
+int32_t png_seek(PNGFILE *page, int32_t position)
+{
+  if (!png_file)
+    return 0;
+  page = page; // Avoid warning
+  return png_file.seek(position);
+}
+
+// callback function to draw pixels to the display
+void png_draw(PNGDRAW *pDraw)
+{
+  uint16_t line_buffer[MAX_IMAGE_WIDTH];
+  png->getLineAsRGB565(pDraw, line_buffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  tft.pushImage(x_pos, y_pos + pDraw->y, pDraw->iWidth, 1, line_buffer);
+}
+
+void initLCD () {
+  tft.begin(); // initialize the TFT screen
+  #ifdef FLIP_SCREEN
+    tft.setRotation(2);
+  #endif
+
+  //  draw the title screen
+  tft.fillScreen(TFT_YELLOW);
+  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+
+  tft.setCursor(10, 10, 4);
+  tft.setTextSize(1);
+  tft.println("RetroAchievements");
+  tft.setCursor(140, 40, 4);
+  tft.println("Adapter");
+
+  tft.fillRoundRect(16, 76, 208, 128, 15, TFT_BLUE);
+  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
+
+  tft.setCursor(75, 220, 2);
+  tft.println("by Odelot & GH");
+}
+#endif
+
+/**
+ * functions related to manage the fifo of achievements
+ */
+
+// initialize the fifo
+void fifo_init(achievements_FIFO_t *fifo)
 {
   fifo->head = 0;
   fifo->tail = 0;
   fifo->count = 0;
 }
 
-bool fifo_is_empty(FIFO_t *fifo)
+// check if the fifo is empty
+bool fifo_is_empty(achievements_FIFO_t *fifo)
 {
   return fifo->count == 0;
 }
 
-bool fifo_is_full(FIFO_t *fifo)
+// check if the fifo is full
+bool fifo_is_full(achievements_FIFO_t *fifo)
 {
-  return fifo->count == FIFO_SIZE;
+  return fifo->count == ACHIEVEMENTS_FIFO_SIZE;
 }
 
-bool fifo_enqueue(FIFO_t *fifo, achievements_t value)
+// enqueue a achievement in the fifo
+bool fifo_enqueue(achievements_FIFO_t *fifo, achievements_t value)
 {
   if (fifo_is_full(fifo))
   {
-    return false; // FIFO cheia
+    return false; // FIFO is full
   }
   fifo->buffer[fifo->tail] = value;
-  fifo->tail = (fifo->tail + 1) % FIFO_SIZE;
+  fifo->tail = (fifo->tail + 1) % ACHIEVEMENTS_FIFO_SIZE;
   fifo->count++;
   return true;
 }
 
-bool fifo_dequeue(FIFO_t *fifo, achievements_t *value)
+// dequeue a achievement from the fifo
+bool fifo_dequeue(achievements_FIFO_t *fifo, achievements_t *value)
 {
   if (fifo_is_empty(fifo))
   {
-    return false; // FIFO vazia
+    return false; // FIFO is empty
   }
   *value = fifo->buffer[fifo->head];
-  fifo->head = (fifo->head + 1) % FIFO_SIZE;
+  fifo->head = (fifo->head + 1) % ACHIEVEMENTS_FIFO_SIZE;
   fifo->count--;
   return true;
 }
 
-FIFO_t achievements_fifo;
+/**
+ * functions related to the sound
+ */
 
+// play a sound to get the user attention
 void play_attention_sound()
 {
   delay(35);
@@ -445,6 +1044,7 @@ void play_attention_sound()
   noTone(SOUND_PIN);
 }
 
+// play a sound to indicate a success
 void play_success_sound()
 {
 
@@ -464,6 +1064,74 @@ void play_success_sound()
   noTone(SOUND_PIN);
 }
 
+
+// play a sound to indicate a success (FF Victory Fanfare)
+void play_victory_sound()
+{
+  // Timing constants for the melody
+  const int BIG_GAP   = 45;   // big gap 
+  const int NOTE_GAP  = 30;   // normal gap between notes
+  const int SIXTEENTH = 100;
+  const int EIGHTH    = 200;
+  const int QUARTER   = 400;
+  const int DOTTED_Q  = 600;
+  const int HALF      = 800;
+  
+  // Intro: C C C C 
+  tone(SOUND_PIN, NOTE_C5);
+  delay(SIXTEENTH);
+  noTone(SOUND_PIN);
+  delay(BIG_GAP);
+  
+  tone(SOUND_PIN, NOTE_C5);
+  delay(SIXTEENTH);
+  noTone(SOUND_PIN);
+  delay(BIG_GAP);
+  
+  tone(SOUND_PIN, NOTE_C5);
+  delay(SIXTEENTH);
+  noTone(SOUND_PIN);
+  delay(BIG_GAP);
+  
+   
+  // C (long note)
+  tone(SOUND_PIN, NOTE_C5);
+  delay(DOTTED_Q);
+  noTone(SOUND_PIN);
+  delay(NOTE_GAP);
+  
+  // Ab (quarter)
+  tone(SOUND_PIN, NOTE_GS4);
+  delay(QUARTER);
+  noTone(SOUND_PIN);
+  delay(NOTE_GAP);
+  
+  // Bb (quarter)
+  tone(SOUND_PIN, NOTE_AS4);
+  delay(QUARTER);
+  noTone(SOUND_PIN);
+  delay(NOTE_GAP);
+  
+  // C (8th)
+  tone(SOUND_PIN, NOTE_C5);
+  delay(EIGHTH);
+  noTone(SOUND_PIN);
+  delay(SIXTEENTH + NOTE_GAP); // rest
+  
+  // Bb (16th)
+  tone(SOUND_PIN, NOTE_AS4);
+  delay(SIXTEENTH);
+  noTone(SOUND_PIN);
+  delay(NOTE_GAP);
+  
+  // C (hold - final note)
+  tone(SOUND_PIN, NOTE_C5);
+  delay(HALF + QUARTER);
+  noTone(SOUND_PIN);
+
+}
+
+// play a sound to indicate an error
 void play_error_sound()
 {
   delay(100);
@@ -474,32 +1142,65 @@ void play_error_sound()
   noTone(SOUND_PIN);
 }
 
+// play a sound to indicate an achievement unlocked
 void play_sound_achievement_unlocked()
 {
-  for (int thisNote = 0; thisNote < 4; thisNote++)
-  {
+  int snd_notes_achievement_unlocked[] = {
+      NOTE_D5, NOTE_D5, NOTE_CS6, NOTE_D6};
 
-    int noteDuration = snd_notes_duration_achievement_unlocked[thisNote] * 16;
-    tone(SOUND_PIN, snd_notes_achievement_unlocked[thisNote], snd_velocity_achievement_unlocked[thisNote]);
-    delay(noteDuration);
-    // stop the tone playing:
+  int snd_velocity_achievement_unlocked[] = {
+      52,
+      37,
+      83,
+      74,
+  };
+
+  int snd_notes_duration_achievement_unlocked[] = {
+      2,
+      4,
+      3,
+      12,
+  };
+  for (int this_note = 0; this_note < 4; this_note++)
+  {
+    int note_duration = snd_notes_duration_achievement_unlocked[this_note] * 16;
+    tone(SOUND_PIN, snd_notes_achievement_unlocked[this_note], snd_velocity_achievement_unlocked[this_note]);
+    delay(note_duration);
     noTone(SOUND_PIN);
   }
 }
 
-void print_line(String text, int line, int line_status)
+
+/**
+ * functions related to the TFT screen and PNG decoder
+ */
+
+// print a line of text in the TFT screen
+void print_line(const char* text, int line, int line_status)
 {
-  print_line(text, line, line_status, 0);
+  print_line(text, line, line_status, 0, TFT_BLACK);
 }
 
-void print_line(String text, int line, int line_status, int delta)
+// print a line of text in the TFT screen
+void print_line_bgcolor(const char* text, int line, int line_status, int color)
 {
+  print_line(text, line, line_status, 0, color);
+}
+
+void print_line(const char* text, int line, int line_status, int delta) {
+  print_line(text, line, line_status, delta, TFT_BLACK);
+}
+
+// print a line of text in the TFT screen with a delta (left to right)
+void print_line(const char* text, int line, int line_status, int delta, int color)
+{
+  #ifdef ENABLE_LCD
   tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK, true);
+  tft.setTextColor(TFT_WHITE, color, true);
   tft.setCursor(20, 90 + line * 22, 2);
   tft.println("                                 ");
   tft.setCursor(46 + delta, 90 + line * 22, 2);
-  if (text.length() == 0)
+  if (text == nullptr || text[0] == '\0')
   {
     return;
   }
@@ -516,9 +1217,225 @@ void print_line(String text, int line, int line_status, int delta)
   {
     tft.fillCircle(32, 98 + line * 22, 7, TFT_GREEN);
   }
+  #endif
 }
 
-void beginEEPROM(bool force)
+// clean the text in the TFT screen
+void clean_screen_text()
+{
+  print_line("", 0, -1);
+  print_line("", 1, -1);
+  print_line("", 2, -1);
+  print_line("", 3, -1);
+  print_line("", 4, -1);
+}
+
+// Show WiFi signal strength icon at top-right corner
+void showWifiStatus()
+{
+#ifdef ENABLE_LCD
+  if (WiFi.status() != WL_CONNECTED) {
+    // Draw X for no connection
+    tft.drawLine(215, 5, 235, 20, TFT_RED);
+    tft.drawLine(235, 5, 215, 20, TFT_RED);
+    return;
+  }
+  
+  int rssi = WiFi.RSSI();
+  int bars = 0;
+  if (rssi > -50) bars = 4;
+  else if (rssi > -60) bars = 3;
+  else if (rssi > -70) bars = 2;
+  else if (rssi > -80) bars = 1;
+  
+  // Clear area and draw WiFi bars
+  tft.fillRect(215, 5, 22, 18, TFT_YELLOW);
+  for (int i = 0; i < 4; i++) {
+    uint16_t color = (i < bars) ? TFT_GREEN : TFT_DARKGREY;
+    int barHeight = 4 + i * 4;
+    tft.fillRect(217 + i * 5, 22 - barHeight, 3, barHeight, color);
+  }
+#endif
+}
+
+// Show achievement counter at top-left corner
+void showAchievementCounter()
+{
+#ifdef ENABLE_LCD
+  if (total_achievements > 0) {
+    char counter[16];
+    sprintf(counter, "%d/%d", unlocked_achievements, total_achievements);
+    tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    // Clear area first
+    tft.fillRect(5, 5, 60, 18, TFT_YELLOW);
+    tft.drawString(counter, 8, 8, 2);
+  }
+#endif
+}
+
+// show the title screen
+void show_title_screen()
+{
+  setSemaphore(LED_ON, LED_GREEN);
+#ifdef ENABLE_LCD  
+  analogWrite(LCD_BRIGHTGBS_PIN, 150); // set the brightness of the TFT screen
+  setCpuFrequencyMhz(160);
+  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+
+  tft.setTextSize(1);
+  tft.setTextPadding(240);
+  tft.drawString("", 0, 10, 4);
+  tft.drawString("", 0, 40, 4);
+  tft.setTextDatum(MC_DATUM);
+
+  // if game name is longer than 18 chars, add ... at the end
+  String esp_game_name = game_name;
+  if (esp_game_name.length() > 18)
+  {
+    esp_game_name = esp_game_name.substring(0, 18 - 3) + "...";
+  }
+
+  tft.drawString(esp_game_name, 120, 40, 4);
+  tft.setTextPadding(0);
+
+  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
+  x_pos = 72;
+  y_pos = 92;
+  String file_name = "/title_" + game_id + ".png";
+  int16_t rc = png->open(file_name.c_str(), png_open, png_close, png_read, png_seek, png_draw);
+  if (rc == PNG_SUCCESS)
+  {
+    tft.startWrite();
+    uint32_t dt = millis();
+    rc = png->decode(NULL, 0);
+    tft.endWrite();
+    png->close();
+  }
+  
+  // Show status indicators
+  showWifiStatus();
+  showAchievementCounter();
+  
+  already_showed_title_screen = true;
+  setCpuFrequencyMhz(80);
+#endif
+}
+
+// show the achievement screen
+void show_achievement(achievements_t achievement)
+{
+  setSemaphore(LED_BLINK_FAST, LED_GREEN);
+  
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  char aux[256];
+  sprintf(aux, "A=%s;%s;%s", "0", achievement.title.c_str(), achievement.url.c_str());
+  send_ws_data(aux);
+#endif
+#ifdef ENABLE_LCD  
+  analogWrite(LCD_BRIGHTGBS_PIN, 200); // set the brightness of the TFT screen
+  // if achievement title is longer than 26 chars, add ... at the end
+  if (achievement.title.length() > 26)
+  {
+    achievement.title = achievement.title.substring(0, 26 - 3) + "...";
+  }
+
+  setCpuFrequencyMhz(160);
+  
+  // Download achievement image first
+  char file_name[64];
+  sprintf(file_name, "/achievement_%d.png", achievement.id);
+  try_download_file(achievement.url, file_name);
+  
+  // Helper lambda to redraw the achievement screen with a specific background color
+  auto redrawAchievementScreen = [&](uint16_t bgColor) {
+    tft.fillRoundRect(20, 80, 200, 120, 12, bgColor);
+    print_line_bgcolor("New Achievement Unlocked!", 0, 0, bgColor);
+    print_line_bgcolor("", 1, -1, bgColor);
+    print_line_bgcolor("", 2, -1, bgColor);
+    print_line_bgcolor("", 3, -1, bgColor);
+    print_line_bgcolor(achievement.title.c_str(), 4, -1, bgColor);
+    
+    // Redraw the achievement image
+    x_pos = 50;
+    y_pos = 110;
+    int16_t rc = png->open(file_name, png_open, png_close, png_read, png_seek, png_draw);
+    if (rc == PNG_SUCCESS)
+    {
+      tft.startWrite();
+      png->decode(NULL, 0);
+      tft.endWrite();
+      png->close();
+    }
+  };
+  
+  // Initial draw with black background
+  redrawAchievementScreen(TFT_BLACK);
+  Serial.println(achievement.title);
+  
+  // Check if game was mastered (all achievements unlocked)
+  //if (unlocked_achievements == 1) //test
+  if (unlocked_achievements > 0 && unlocked_achievements == total_achievements)
+  {
+    // MASTERED! Celebration mode
+    Serial.println(F("GAME MASTERED! Playing victory fanfare"));
+    
+    // Show MASTERED text in larger font over the footer area
+    tft.setTextColor(TFT_BLACK, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("** MASTERED! **", 120, 225, 4);  // Larger font (4), above footer
+    tft.setTextDatum(TL_DATUM);  // Reset datum
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            
+    uint16_t colorBlack = TFT_BLACK;
+    uint16_t colorGreen = tft.color565(0, 100, 0);  
+    uint16_t colors[] = { colorGreen, colorBlack };
+    int colorIndex = 0;
+    
+    // Flash background a few times before music
+    for (int i = 0; i < 6; i++)
+    {
+      redrawAchievementScreen(colors[colorIndex]);
+      colorIndex = (colorIndex + 1) % 2;
+      delay(150);
+    }
+    
+    // Play victory fanfare
+    play_victory_sound();
+    
+    // Flash more after music
+    for (int i = 0; i < 6; i++)
+    {
+      redrawAchievementScreen(colors[colorIndex]);
+      colorIndex = (colorIndex + 1) % 2;
+      delay(150);
+    }
+    
+    // Restore black background
+    redrawAchievementScreen(TFT_BLACK);
+    
+  }
+  else
+  {
+    // Normal achievement sound
+    play_sound_achievement_unlocked();
+  }
+  
+  go_back_to_title_screen = true;
+  go_back_to_title_screen_timestamp = millis();
+  showAchievementCounter();
+  setCpuFrequencyMhz(80);
+#endif
+}
+
+
+/**
+ * functions related to the EEPROM
+ */
+
+// initialize the EEPROM
+void init_EEPROM(bool force)
 {
   EEPROM.begin(EEPROM_SIZE);
   if (EEPROM.read(0) != EEPROM_ID_1 || EEPROM.read(1) != EEPROM_ID_2 || force == true)
@@ -530,105 +1447,22 @@ void beginEEPROM(bool force)
       EEPROM.write(i, 0);
     }
     EEPROM.commit();
-    Serial.print("eeprom initialized");
+    Serial.print(F("eeprom initialized"));
   }
 }
 
-bool isConfigured()
+// check if the EEPROM is configured
+bool is_eeprom_configured()
 {
   return EEPROM.read(2) == 1;
 }
 
-// custom paragraph and parameters to the configuration page
-const char head[] = "<style>#l,#i,#z{text-align:center}#i,#z{margin:15px auto}button{background-color:#0000FF;}#l{margin:0 auto;width:100%; font-size: 28px;}p{margin-bottom:-5px}[type='checkbox']{height: 20px;width: 20px;}</style><script>var w=window,d=document,e=\"password\";function iB(a,b,c){a.insertBefore(b,c)}function gE(a){return d.getElementById(a)}function cE(a){return d.createElement(a)};\"http://192.168.1.1/\"==w.location.href&&(w.location.href+=\"wifi\");</script>\0";
-const char html_p1[] = "<p id='z' style='width: 80%;'>Enter the RetroAchievements credentials below:</p>\0";
-const char html_p2[] = "<p>&#8226; RetroAchievements user name: </p>\0";
-const char html_p3[] = "<p>&#8226; RetroAchievements user password: </p>\0";
-
-const char html_s[] = "<script>gE(\"s\").required=!0;l=cE(\"div\");l.innerHTML=\"NES RetroAchievements Adapter\",l.id=\"l\";m=d.body.childNodes[0];iB(m,l,m.childNodes[0]);p=cE(\"p\");p.id=\"i\",p.innerHTML=\"Choose the network you want to connect with:\",iB(m,p,m.childNodes[1]);</script>\0";
-
-WiFiManagerParameter custom_p1(html_p1);
-WiFiManagerParameter custom_p2(html_p2);
-WiFiManagerParameter custom_param_1("un", NULL, "", 24, " required autocomplete='off'");
-WiFiManagerParameter custom_p3(html_p3);
-WiFiManagerParameter custom_param_2("up", NULL, "", 14, " type='password' required");
-WiFiManagerParameter custom_s(html_s);
-
-void configureWifiManager()
-{
-  wm.setBreakAfterConfig(true);
-  wm.setCaptivePortalEnable(true);
-  wm.setMinimumSignalQuality(40);
-  wm.setConnectTimeout(30);
-  wm.addParameter(&custom_p1);
-  wm.addParameter(&custom_p2);
-  wm.addParameter(&custom_param_1);
-  wm.addParameter(&custom_p3);
-  wm.addParameter(&custom_param_2);
-  wm.addParameter(&custom_s);
-  wm.setCustomHeadElement(head);
-  wm.setDarkMode(true);
-  wm.setAPStaticIPConfig(IPAddress(192, 168, 1, 1), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0));
-}
-
-void clean_screen_text()
-{
-  print_line("", 0, 0);
-  print_line("", 1, 0);
-  print_line("", 2, 0);
-  print_line("", 3, 0);
-  print_line("", 4, 0);
-}
-
-String try_login_RA(String ra_user, String ra_pass)
-{
-  String response = "";
-  DeserializationError error;
-  int httpCode;
-  client.setInsecure();
-  String loginPath = "r=login&u=@USER@&p=@PASS@";
-  loginPath.replace("@USER@", ra_user);
-  loginPath.replace("@PASS@", ra_pass);
-  https.begin(client, base_url + loginPath);
-
-  const char *headerKeys[] = {"date"};                                       // The only header I care about.
-  const size_t headerKeysCount = sizeof(headerKeys) / sizeof(headerKeys[0]); // Returns 1
-  https.collectHeaders(headerKeys, headerKeysCount);
-
-  httpCode = https.GET();
-  // TODO use this timestamp to control temp files on littleFS
-  String dateHeader = https.header("date");
-  Serial.println("Header Date: " + dateHeader);
-
-  if (httpCode != HTTP_CODE_OK)
-  {
-    state = 253; // error - login failed
-    Serial0.print("ERROR=253-LOGIN_FAILED\r\n");
-    Serial.print("ERROR=253-LOGIN_FAILED\r\n");
-    return String("null");
-  }
-  response = https.getString();
-
-  https.end();
-
-  error = deserializeJson(jsonDoc, response);
-
-  if (error)
-  {
-    state = 252; // error - json parse login failed
-    Serial0.print("ERROR=252-JSON_PARSE_ERROR\r\n");
-    Serial.print("ERROR=252-JSON_PARSE_ERROR\r\n");
-    return String("null");
-  }
-
-  String ra_token(jsonDoc["Token"]);
-  return ra_token;
-}
-
+// save the RA credentials in the EEPROM
 void save_configuration_info_eeprom(String ra_user, String ra_pass)
 {
-  int user_len = ra_user.length();
-  int pass_len = ra_pass.length();
+  
+  uint8_t user_len = ra_user.length();
+  uint8_t pass_len = ra_pass.length();
   EEPROM.write(2, 1);
   EEPROM.write(3, user_len);
   for (int i = 0; i < user_len; i++)
@@ -644,30 +1478,129 @@ void save_configuration_info_eeprom(String ra_user, String ra_pass)
   EEPROM.commit();
 }
 
-String read_ra_user_from_eeprom()
+// read the RA user from the EEPROM into a provided buffer
+// Returns the length of the user string
+size_t read_ra_user_from_eeprom(char* buffer, size_t buffer_size)
 {
-  int len = EEPROM.read(3);
-  String ra_user = "";
+  uint8_t len = EEPROM.read(3);
+  if (len >= buffer_size) len = buffer_size - 1;
   for (int i = 0; i < len; i++)
   {
-    ra_user += (char)EEPROM.read(4 + i);
+    buffer[i] = (char)EEPROM.read(4 + i);
   }
-  return ra_user;
+  buffer[len] = '\0';
+  return len;
 }
 
-String read_ra_pass_from_eeprom()
+// read the RA pass from the EEPROM into a provided buffer
+// Returns the length of the pass string
+size_t read_ra_pass_from_eeprom(char* buffer, size_t buffer_size)
 {
-  int ra_user_len = EEPROM.read(3);
-  int len = EEPROM.read(4 + ra_user_len);
-  String ra_pass = "";
+  uint8_t ra_user_len = EEPROM.read(3);
+  uint8_t len = EEPROM.read(4 + ra_user_len);
+  if (len >= buffer_size) len = buffer_size - 1;
   for (int i = 0; i < len; i++)
   {
-    ra_pass += (char)EEPROM.read(5 + ra_user_len + i);
+    buffer[i] = (char)EEPROM.read(5 + ra_user_len + i);
   }
-  return ra_pass;
+  buffer[len] = '\0';
+  return len;
 }
 
-// handle the reset
+/**
+ * functions related to the wifi manager
+ */
+
+void wifi_manager_init(WiFiManager &wm)
+{
+  // wm.setDebugOutput(true);
+  wm.setHostname("gb-ra-adapter");
+  wm.setBreakAfterConfig(true);
+  wm.setCaptivePortalEnable(true);
+  wm.setMinimumSignalQuality(40);
+  wm.setConnectTimeout(30);
+  wm.setCustomHeadElement(head);
+  wm.setDarkMode(true);
+  wm.setAPStaticIPConfig(IPAddress(192, 168, 1, 1), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0));
+}
+
+
+/**
+ * functions related to the RA login
+ */
+String try_login_RA(String ra_user, String ra_pass)
+{
+  // print_memory_stats("BEFORE LOGIN");
+  
+  // Construir URL completa em buffer fixo
+  char login_url[384];
+  snprintf(login_url, sizeof(login_url), "%sr=login&u=%s&p=%s", 
+           base_url, ra_user.c_str(), ra_pass.c_str());
+
+  
+  // print_memory_stats("BEFORE HTTP REQUEST (login)");
+  
+  int ret = perform_http_request_buffer(login_url, GET, "", 0, response, true, 3, 5000, 500);
+  
+  // print_memory_stats("AFTER HTTP REQUEST (login)");
+  
+  if (ret < 0)
+  {
+    Serial.print(F("request error: "));
+    Serial.println(http_request_result_to_cstr(ret));
+    state = STATE_ERROR_LOGIN_FAILED;
+    Serial0.print(F("ERROR=253-LOGIN_FAILED\r\n"));
+    Serial.print(F("ERROR=253-LOGIN_FAILED\r\n"));
+    return String("null");
+  }
+
+ 
+  String ra_token = extractTokenFromBuffer(response);
+  ra_token.trim();
+  
+  Serial.print(F("RA Token: ")); Serial.println(ra_token);
+  
+  // print_memory_stats("AFTER TOKEN EXTRACT");
+  
+  response.clear();
+  
+  // print_memory_stats("AFTER LOGIN COMPLETE");
+
+  return ra_token;
+}
+
+// Versão que extrai token do CharBufferStream sem criar cópia
+String extractTokenFromBuffer(CharBufferStream &buf)
+{
+  const char* key = "\"Token\":";
+  int start = buf.indexOf(key);
+  if (start == -1) return "";
+
+  // Avança até o início do valor (pula aspas)
+  start = buf.indexOf("\"", start + 8);
+  if (start == -1) return "";
+
+  int end = buf.indexOf("\"", start + 1);
+  if (end == -1) return "";
+
+  // Extrai substring diretamente
+  char* data = buf.data();
+  int len = end - start - 1;
+  if (len <= 0 || len > 64) return "";
+  
+  char token[65];
+  memcpy(token, data + start + 1, len);
+  token[len] = '\0';
+  
+  return String(token);
+}
+
+
+/**
+ * functions related to reset the adapter configuration
+ */
+
+// handle the reset routine
 void handle_reset()
 {
   if (ENABLE_RESET == 0)
@@ -675,6 +1608,7 @@ void handle_reset()
     return;
   }
   unsigned long start = millis();
+  setSemaphore(LED_BLINK_FAST, LED_YELLOW);
   while (digitalRead(RESET_PIN) == LOW && (millis() - start) < 10000)
   {
     yield();
@@ -682,52 +1616,86 @@ void handle_reset()
   }
   if ((millis() - start) >= RESET_PRESSED_TIME)
   {
-
-    Serial.print("reset");
-    beginEEPROM(true);
+    setSemaphore(LED_BLINK_SLOW, LED_YELLOW);
+    Serial.print(F("reset"));
+    init_EEPROM(true);
     print_line("Reset successful!", 1, 0);
     print_line("Reboot in 5 seconds...", 2, 0);
     delay(5000);
     ESP.restart();
   }
+  setSemaphore(LED_BLINK_MEDIUM, LED_YELLOW);
   print_line("Reset aborted!", 0, 1);
+}
+
+/**
+ * functions related to the littleFS
+ */
+
+// retry download a file up to 3 times with exponential backoff
+int try_download_file(String url, String file_name)
+{
+  int attempt = 0;
+  int maxRetries = 3;
+  int retryDelayMs = 250;
+  while (attempt < maxRetries)
+  {
+    int ret = download_file_to_littleFS(url, file_name);
+    if (ret == 0)
+    {
+      return 0; // File downloaded successfully
+    }
+    else
+    {
+      Serial.print(F("Attempt ")); Serial.print(attempt + 1); Serial.println(F(" failed. Retrying..."));
+    }
+    attempt++;
+    if (attempt <= maxRetries)
+    {
+      delay(retryDelayMs * pow(2, attempt)); // Exponential backoff
+    }
+  }
+  return -1;
 }
 
 // Fetch a file from the URL given and save it in LittleFS
 // Return 1 if a web fetch was needed or 0 if file already exists
-bool download_file_to_littleFS(String url, String filename)
+int download_file_to_littleFS(String url, String file_name)
 {
-
+  int ret = 0;
   // If it exists then no need to fetch it
-  if (LittleFS.exists(filename) == true)
+  if (LittleFS.exists(file_name) == true)
   {
-    Serial.print("Found " + filename + " in LittleFS\n");
-    return 0;
+    Serial.print("Found " + file_name + " in LittleFS\n"); // debug
+    return ret;
   }
 
-  Serial.print("Downloading " + filename + " from " + url + "\n");
+  // before use LittleFS, check if we have enough space and delete files if necessary
+  check_free_space_littleFS();
+
+  Serial.print("Downloading " + file_name + " from " + url + "\n"); // debug
 
   // Check WiFi connection
   if ((WiFi.status() == WL_CONNECTED))
   {
-
+    NetworkClientSecure client;
     HTTPClient http;
     client.setInsecure();
     http.begin(client, url);
 
     // Start connection and send HTTP header
-    int httpCode = http.GET();
-    if (httpCode == 200)
+    int http_code = http.GET();
+    if (http_code == 200)
     {
-      fs::File f = LittleFS.open(filename, "w+");
+      fs::File f = LittleFS.open(file_name, "w+");
       if (!f)
       {
-        Serial.print("file open failed\n");
-        return 0;
+        Serial.print(F("file open failed\n")); // debug
+        return -1;
       }
-            
+
       // File found at server
-      if (httpCode == HTTP_CODE_OK)
+      if (http_code == HTTP_CODE_OK)
       {
 
         // Get length of document (is -1 when Server sends no Content-Length header)
@@ -767,82 +1735,1260 @@ bool download_file_to_littleFS(String url, String filename)
     }
     else
     {
-      Serial.printf("download failed, error: %s\n", http.errorToString(httpCode).c_str());
+      Serial.print(F("download failed, error: ")); Serial.println(http.errorToString(http_code)); // debug
+      ret = -1;
     }
     http.end();
   }
-  return 1; // File was fetched from web
+  return ret;
 }
 
+// auxiliary function to implement startsWith for char*
+bool prefix(const char *pre, const char *str)
+{
+  return strncmp(pre, str, strlen(pre)) == 0;
+}
+
+// monitor wifi events - connection
+void onWiFiConnect(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  Serial.println(F("WiFi connected."));
+}
+
+// monitor wifi events - disconnection
+void onWiFiDisconnect(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  Serial.println(F("WiFi disconnected."));
+  WiFi.reconnect();
+}
+
+// monitor wifi events - got IP address
+void onWiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  Serial.print(F("Got IP: "));
+  Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  config_mDNS();
+#endif
+}
+
+// calculate how much free space we have on littleFS in percentage
+float get_free_space_littleFS()
+{
+  float free_space = (float)LittleFS.totalBytes() - (float)LittleFS.usedBytes();
+  free_space = (free_space / (float)LittleFS.totalBytes()) * 100.0;
+  // Serial.print("Total Bytes: "); //debug
+  // Serial.println(LittleFS.totalBytes()); //debug
+  // Serial.print("Used Bytes: "); //debug
+  // Serial.println(LittleFS.usedBytes()); //debug
+  Serial.print(F("Free space: "));
+  Serial.print(free_space);
+  Serial.println(F("%"));
+  return free_space;
+}
+
+// remove all images from littleFS
+void remove_all_image_files_littleFS()
+{
+  fs::File root = LittleFS.open("/");
+  fs::File file = root.openNextFile();
+  while (file)
+  {
+    String file_name = file.name();
+    file.close();
+    if (prefix("achievement_", file_name.c_str()) || prefix("title_", file_name.c_str()))
+    {
+      Serial.print("Removing " + file_name + "\n"); // debug
+      file_name = "/" + file_name;
+      LittleFS.remove(file_name);
+    }
+    file = root.openNextFile();
+  }
+}
+
+// remove all files if we are running out of space
+void check_free_space_littleFS()
+{
+  float free_space = get_free_space_littleFS();
+  if (free_space < 3) // each image uses ~0.5%
+  {
+    Serial.print(F("Free space is less than 3%, removing all image files\n")); // debug
+    remove_all_image_files_littleFS();
+  }
+}
+
+/**
+ * functions related with mDNS, websocket and the experimental internal web app
+ */
+
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+
+// configure mDNS
+void config_mDNS()
+{
+  String mdnsName = "gb-ra-adapter";
+
+  MDNS.end();
+  if (!MDNS.begin(mdnsName.c_str()))
+  {
+    Serial.println(F("error - begin mDNS"));
+    return;
+  }
+
+  Serial.print(F("mDNS init: "));
+  Serial.println(mdnsName + ".local");
+
+  MDNS.addService("nraa", "tcp", 80);
+  Serial.println(F("service mDNS announced"));
+}
+
+// handle websocket events
+void on_websocket_event(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                        AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+
+  if (type == WS_EVT_CONNECT)
+  {
+    // just one simultaneous connection for the time being
+    Serial.println(F("new ws connection"));
+    if (ws_client != NULL)
+    {
+      Serial.println(F("closing last connection"));
+      ws_client->close();
+    }
+    ws_client = client;
+    client->setCloseClientOnQueueFull(false);
+    client->ping();
+  }
+  else if (type == WS_EVT_PONG)
+  {
+    Serial.println(F("ws pong"));
+    if (game_id != "0") // we have a game running
+    {
+      // send the game name and image to the client
+      char aux[512];
+      sprintf(aux, "G=%s;%s;%s;%s", game_session.c_str(), game_id.c_str(), game_name.c_str(), game_image.c_str());
+      client->text(aux);
+    }
+  }
+  else if (type == WS_EVT_DISCONNECT)
+  {
+    Serial.println(F("ws disconnect"));
+    if (ws_client != NULL)
+    {
+      ws_client->close();
+      ws_client = NULL;
+    }
+  }
+  else if (type == WS_EVT_DATA)
+  {
+    data[len] = 0; 
+    if (strcmp((char *)data, "ping") == 0)
+    {
+      Serial.println(F("ws ping"));
+      client->text("pong");
+    }
+  }
+}
+
+// send websocket data
+void send_ws_data(String data)
+{
+  if (ws_client != NULL)
+  {
+    ws_client->text(data);
+  }
+}
+
+// initialize the websocket server (dynamically allocated to save memory until needed)
+void init_websocket()
+{
+  if (websocket_initialized) {
+    Serial.println(F("WebSocket already initialized"));
+    return;
+  }
+  
+  // print_memory_stats("BEFORE WEBSOCKET INIT");
+  
+  // Instantiate dynamically only now (after patch)
+  if (ws == nullptr) {
+    ws = new AsyncWebSocket("/ws");
+    if (ws == nullptr) {
+      Serial.println(F("Failed to allocate AsyncWebSocket"));
+      return;
+    }
+  }
+  
+  if (server == nullptr) {
+    server = new AsyncWebServer(80);
+    if (server == nullptr) {
+      Serial.println(F("Failed to allocate AsyncWebServer"));
+      delete ws;
+      ws = nullptr;
+      return;
+    }
+  }
+  
+  // ws begin
+  ws->onEvent(on_websocket_event);
+  
+  // Serve static files (HTML, CSS, JS)
+  server->serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+
+  server->serveStatic("/sw.js", LittleFS, "/sw.js")
+      .setCacheControl("no-cache, no-store, must-revalidate");
+  server->serveStatic("/index.html", LittleFS, "/index.html")
+      .setCacheControl("no-cache, no-store, must-revalidate");
+
+  server->serveStatic("/snd.mp3", LittleFS, "/snd.mp3")
+      .setCacheControl("max-age=86400");
+
+  server->addHandler(ws);
+  server->begin();
+  
+#ifdef ENABLE_LCD
+  // Initialize PNG decoder now (after patch, when memory is available)
+  if (png == nullptr) {
+    png = new PNG();
+    if (png == nullptr) {
+      Serial.println(F("Failed to allocate PNG decoder"));
+    }
+  }
+#endif
+  
+  // Configure mDNS here, along with the websocket (after patch)
+  config_mDNS();
+  
+  websocket_initialized = true;
+  Serial.println(F("WebSocket server initialized"));
+  // print_memory_stats("AFTER WEBSOCKET INIT");
+}
+#endif
+
+/**
+ * functions related to the HTTP requests, retry, error handling, etc
+ */
+
+// HTTP request result codes to const char* (avoids String allocation)
+const char* http_request_result_to_cstr(int code)
+{
+  switch (code)
+  {
+  case HTTP_SUCCESS:
+    return "HTTP_SUCCESS";
+  case HTTP_ERR_NO_WIFI:
+    return "HTTP_ERR_NO_WIFI";
+  case HTTP_ERR_REQUEST_FAILED:
+    return "HTTP_ERR_REQUEST_FAILED";
+  case HTTP_ERR_HTTP_4XX:
+    return "HTTP_ERR_HTTP_4XX";
+  case HTTP_ERR_TIMEOUT:
+    return "HTTP_ERR_TIMEOUT";
+  case HTTP_ERR_REPONSE_TOO_BIG:
+    return "HTTP_ERR_REPONSE_TOO_BIG";
+  default:
+    return "UNKNOWN_ERROR";
+  }
+}
+
+// perform an HTTP request writing directly to CharBufferStream with retries and exponential backoff
+int perform_http_request_buffer(
+    const char* url,
+    HttpRequestMethod method,
+    const char* payload,
+    size_t payload_len,
+    CharBufferStream &resp,
+    bool isIdempotent,
+    int maxRetries,
+    int timeoutMs,
+    int retryDelayMs)
+{
+  int attempt = 0;
+  int wifiRetries = 3;
+  int code = HTTP_ERR_REQUEST_FAILED;
+
+  while (attempt <= maxRetries)
+  {
+    if (attempt != 0) {
+      Serial.print(F("Attempt ")); Serial.print(attempt); Serial.println(F(" to request"));
+    }
+    
+    int wifiAttempt = 0;
+    while (WiFi.status() != WL_CONNECTED && wifiAttempt < wifiRetries) {
+      delay(500);
+      wifiAttempt++;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      code = HTTP_ERR_NO_WIFI;
+      delay(retryDelayMs * pow(2, attempt));
+      attempt++;
+      continue;
+    }
+
+    
+    globalSecureClient.setInsecure();
+    globalSecureClient.setTimeout(timeoutMs / 1000 + 30); // +30s extra for chunked encoding
+    globalHttpClient.setTimeout(timeoutMs);
+    
+    Serial.print(F("Connecting to: ")); Serial.println(url);
+    Serial.print(F("data: ")); Serial.println(payload);
+    
+    if (!globalHttpClient.begin(globalSecureClient, url)) {
+      Serial.println(F("HTTPClient begin failed"));
+      attempt++;
+      delay(retryDelayMs * pow(2, attempt));
+      continue;
+    }
+    
+    const char user_agent[] = "GB_RA_ADAPTER/0.2 rcheevos/11.6";
+    globalHttpClient.setUserAgent(user_agent);
+
+    Serial.println(F("Sending request..."));
+    
+    if (method == GET) {
+      code = globalHttpClient.GET();
+    } else {
+      globalHttpClient.addHeader("Content-Type", "application/x-www-form-urlencoded");
+      // POST with const char* and explicit length
+      code = globalHttpClient.POST((uint8_t*)payload, payload_len);
+    }
+
+    Serial.print(F("HTTP code: ")); Serial.println(code);
+
+    if (code > 0)
+    {
+      if (code >= 200 && code < 300)
+      {
+        WiFiClient* stream = globalHttpClient.getStreamPtr();
+        int contentLength = globalHttpClient.getSize();
+        bool isChunked = (contentLength == -1);
+        
+        Serial.print(F("Content-Length: ")); Serial.print(contentLength); Serial.print(F(" (chunked: ")); Serial.print(isChunked); Serial.println(F(")"));
+        
+        // Check if it fits in the buffer (if Content-Length is known)
+        if (contentLength > 0 && contentLength > (int)resp.capacity()) {
+          Serial.print(F("Response too big: ")); Serial.print(contentLength); Serial.print(F(" > ")); Serial.println(resp.capacity());
+          globalHttpClient.end();
+          return HTTP_ERR_REPONSE_TOO_BIG;
+        }
+        
+        resp.clear();
+        // Smaller read buffer to reduce stack usage (256 is enough for chunked)
+        uint8_t buff[256];
+        size_t totalRead = 0;
+        unsigned long lastDataTime = millis();
+        unsigned long lastProgressTime = millis();
+        
+        // For chunked encoding, we need to read the chunk size first
+        size_t chunkRemaining = 0;
+        bool chunkSizeRead = !isChunked; // If not chunked, no need to read size
+        
+        // Longer timeout for large payloads (60s total, 20s without progress)
+        const unsigned long readTimeoutMs = 20000;
+        const unsigned long totalTimeoutMs = 60000;
+        unsigned long startTime = millis();
+        
+        while (globalHttpClient.connected() || stream->available())
+        {
+          // Timeout total
+          if (millis() - startTime > totalTimeoutMs) {
+            Serial.println(F("Total timeout exceeded (60s)"));
+            break;
+          }
+          
+          // Timeout if no data received for a long time
+          if (stream->available() == 0) {
+            if (millis() - lastDataTime > readTimeoutMs) {
+              Serial.print(F("Read timeout - no data for ")); Serial.print(readTimeoutMs/1000); Serial.println(F("s"));
+              break;
+            }
+            // Check if connection is still active
+            if (!globalHttpClient.connected()) {
+              Serial.println(F("Connection lost while waiting for data"));
+              break;
+            }
+            delay(10);
+            yield();
+            continue;
+          }
+          
+          lastDataTime = millis();
+          
+          if (isChunked && !chunkSizeRead) {
+            // Read chunk size with timeout - fixed buffer to avoid fragmentation
+            char chunkSizeBuf[16];
+            int chunkSizeIdx = 0;
+            unsigned long chunkSizeStart = millis();
+            while (millis() - chunkSizeStart < 5000 && chunkSizeIdx < 15) {
+              if (stream->available()) {
+                char c = stream->read();
+                if (c == '\n') break;
+                if (c != '\r' && c != ' ') {
+                  chunkSizeBuf[chunkSizeIdx++] = c;
+                }
+              } else {
+                if (!globalHttpClient.connected()) break;
+                delay(1);
+                yield();
+              }
+            }
+            chunkSizeBuf[chunkSizeIdx] = '\0';
+            
+            if (chunkSizeIdx == 0) {
+              continue; // Empty line, skip
+            }
+            chunkRemaining = strtoul(chunkSizeBuf, NULL, 16);
+            chunkSizeRead = true;
+            
+            if (chunkRemaining == 0) {
+              // Final chunk (size 0) - end of response
+              Serial.println(F("Final chunk received"));
+              break;
+            }
+            
+            // Progress log every 5 seconds
+            if (millis() - lastProgressTime > 5000) {
+              Serial.print(F("Progress: ")); Serial.print(totalRead);
+              Serial.print(F(" bytes, chunk: ")); Serial.println(chunkRemaining);
+              lastProgressTime = millis();
+            }
+          }
+          
+          // Determine how much to read
+          size_t toRead = sizeof(buff);
+          if (isChunked && chunkRemaining > 0) {
+            if (toRead > chunkRemaining) toRead = chunkRemaining;
+          } else if (!isChunked && contentLength > 0) {
+            size_t remaining = contentLength - totalRead;
+            if (toRead > remaining) toRead = remaining;
+          }
+          
+          size_t available = stream->available();
+          if (toRead > available) toRead = available;
+          if (toRead == 0) continue;
+          
+          size_t readBytes = stream->readBytes(buff, toRead);
+          size_t written = resp.write(buff, readBytes);
+          totalRead += written;
+          
+          if (isChunked) {
+            chunkRemaining -= readBytes;
+            if (chunkRemaining == 0) {
+              // End of chunk, read the \r\n that comes after with timeout
+              unsigned long crlfStart = millis();
+              while (stream->available() < 2 && globalHttpClient.connected()) {
+                if (millis() - crlfStart > 5000) {
+                  Serial.println(F("Timeout waiting for chunk CRLF"));
+                  break;
+                }
+                delay(1);
+                yield();
+              }
+              if (stream->available() >= 2) {
+                stream->read(); // \r
+                stream->read(); // \n
+              }
+              chunkSizeRead = false; 
+            }
+          }
+          
+          if (written < readBytes) {
+            Serial.println(F("Buffer full during HTTP read"));
+            globalHttpClient.end();
+            return HTTP_ERR_REPONSE_TOO_BIG;
+          }
+          
+          // Se não é chunked e já leu tudo
+          if (!isChunked && contentLength > 0 && totalRead >= (size_t)contentLength) {
+            break;
+          }
+          
+          yield();
+        }
+        
+        Serial.print(F("Total read: ")); Serial.print(totalRead); Serial.println(F(" bytes"));
+        globalHttpClient.end();
+        
+        if (totalRead > 0) {
+          return HTTP_SUCCESS;
+        }
+        code = HTTP_ERR_REQUEST_FAILED;
+      }
+      else if (code >= 400 && code < 500) {
+        globalHttpClient.end();
+        return HTTP_ERR_HTTP_4XX;
+      }
+      else {
+        globalHttpClient.end();
+        if (!isIdempotent && method == HTTP_POST) {
+          return HTTP_ERR_REQUEST_FAILED;
+        }
+      }
+    }
+    else
+    {
+      Serial.print(F("HTTP error code: ")); Serial.println(code);
+      if (code == HTTPC_ERROR_CONNECTION_REFUSED ||
+          code == HTTPC_ERROR_READ_TIMEOUT ||
+          code == HTTPC_ERROR_CONNECTION_LOST) {
+        code = HTTP_ERR_TIMEOUT;
+      } else {
+        code = HTTP_ERR_REQUEST_FAILED;
+      }
+    }
+
+    globalHttpClient.end();
+    attempt++;
+    if (attempt <= maxRetries) {
+      delay(retryDelayMs * pow(2, attempt));
+    }
+  }
+
+  return code;
+}
+
+// ============================================================================
+// Serial Command Handlers - Functions optimized for parsing with char*
+// ============================================================================
+
+/**
+ * Finds the position of a character in a buffer
+ * @param buf Buffer to search
+ * @param len Size of the buffer
+ * @param ch Character to find
+ * @return Position of the character or -1 if not found
+ */
+int find_char(const char* buf, size_t len, char ch) {
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] == ch) return (int)i;
+  }
+  return -1;
+}
+
+/**
+ * Finds the position of "\r\n" in a buffer
+ * @param buf Buffer to search
+ * @param len Size of the buffer
+ * @return Position of '\r' or -1 if not found
+ */
+int find_crlf(const char* buf, size_t len) {
+  for (size_t i = 0; i + 1 < len; i++) {
+    if (buf[i] == '\r' && buf[i + 1] == '\n') return (int)i;
+  }
+  return -1;
+}
+
+/**
+ * Checks if the buffer starts with a prefix
+ */
+bool starts_with(const char* buf, size_t len, const char* prefix) {
+  size_t prefix_len = strlen(prefix);
+  if (len < prefix_len) return false;
+  return memcmp(buf, prefix, prefix_len) == 0;
+}
+
+/**
+ * Handler for REQ command - HTTP requests from the Pico
+ * @param cmd Pointer to the start of the command (after "REQ=")
+ * @param cmd_len Length of the command
+ */
+void handle_req_command(const char* cmd, size_t cmd_len) {
+  // Example: FF;M:POST;U:https://retroachievements.org/dorequest.php;D:r=login2&u=user&p=pass
+  
+  // Find request_id (up to first ';')
+  int pos = find_char(cmd, cmd_len, ';');
+  if (pos < 0 || pos > 8) {
+    Serial.println(F("REQ: invalid request_id"));
+    return;
+  }
+  
+  char request_id[16];
+  memcpy(request_id, cmd, pos);
+  request_id[pos] = '\0';
+  
+  cmd += pos + 1;
+  cmd_len -= pos + 1;
+  
+  // Find method (M:POST or M:GET)
+  if (cmd_len < 3 || cmd[0] != 'M' || cmd[1] != ':') {
+    Serial.println(F("REQ: missing method"));
+    return;
+  }
+  
+  pos = find_char(cmd, cmd_len, ';');
+  if (pos < 0) {
+    Serial.println(F("REQ: invalid method format"));
+    return;
+  }
+  
+  // MMethod is between cmd+2 and cmd+pos
+  // Simplified: assume POST for Pico requests
+  cmd += pos + 1;
+  cmd_len -= pos + 1;
+  
+  // Find URL (U:...)
+  if (cmd_len < 3 || cmd[0] != 'U' || cmd[1] != ':') {
+    Serial.println(F("REQ: missing URL"));
+    return;
+  }
+  
+  pos = find_char(cmd, cmd_len, ';');
+  if (pos < 0) {
+    Serial.println(F("REQ: invalid URL format"));
+    return;
+  }
+  
+  // URL is between cmd+2 and cmd+pos
+  char url[256];
+  size_t url_len = pos - 2;
+  if (url_len >= sizeof(url)) url_len = sizeof(url) - 1;
+  memcpy(url, cmd + 2, url_len);
+  url[url_len] = '\0';
+  
+  cmd += pos + 1;
+  cmd_len -= pos + 1;
+  
+  // Find data (D:...)
+  if (cmd_len < 3 || cmd[0] != 'D' || cmd[1] != ':') {
+    Serial.println(F("REQ: missing data"));
+    return;
+  }
+  
+  // Data starts at cmd+2, goes to the end (minus \r\n if present)
+  const char* data_ptr = cmd + 2;
+  size_t data_len = cmd_len - 2;
+  
+  // Remove trailing \r\n if present
+  while (data_len > 0 && (data_ptr[data_len - 1] == '\r' || data_ptr[data_len - 1] == '\n')) {
+    data_len--;
+  }
+  
+  // Use fixed buffer for data (avoids fragmentation)
+  char data[512];
+  if (data_len >= sizeof(data) - 16) data_len = sizeof(data) - 17; // leave space for "&f=3"
+  memcpy(data, data_ptr, data_len);
+  data[data_len] = '\0';
+  
+  bool is_patch_request = (strncmp(data, "r=patch", 7) == 0);
+  
+  // Final URL (can be lambda) - use direct pointer
+  const char* final_url = url;
+  if (is_patch_request && ENABLE_SHRINK_LAMBDA == 1) {
+    Serial.println(F("ENABLED LAMBDA SHRINK"));
+    final_url = SHRINK_LAMBDA_URL;
+  }
+  
+  if (is_patch_request) {
+    // print_memory_stats("BEFORE PATCH REQUEST");
+    
+    // Trim trailing spaces and add &f=3
+    while (data_len > 0 && data[data_len - 1] == ' ') data_len--;
+    strcpy(data + data_len, "&f=3");
+    data_len += 4;
+    
+    
+  }
+  
+  // Prepare memory for large download
+  if (is_patch_request) {
+    Serial.println(F("Preparing memory for large download..."));
+    // Disable WiFi power save during large download (more stable)
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Small delay to allow the system to free resources
+    delay(50);
+    yield();
+  }
+  
+  response.clear();
+  print_memory_stats("BEFORE HTTP REQUEST (REQ handler)");
+  
+  // Longer timeout for patch requests (30s) as the response can be large (30KB+)
+  int request_timeout = is_patch_request ? 30000 : 5000;
+  
+  // Execute HTTP request using char* version directly
+  int ret = perform_http_request_buffer(final_url, POST, data, data_len, response, true, 3, request_timeout, 500);
+  
+  if (ret < 0) {
+    Serial.print(F("ERROR ON RESPONSE: "));
+    Serial.println(http_request_result_to_cstr(ret));
+    if (ret == HTTP_ERR_REPONSE_TOO_BIG) {
+      state = STATE_ERROR_RESPONSE_TOO_BIG;
+    } else {
+      state = STATE_ERROR_CONNECTIVITY;
+    }
+  } else {
+    // Clean JSON in-place
+    if (is_patch_request) {
+      Serial.print(F("PATCH LENGTH: "));
+      Serial.println(response.length());
+      
+      clean_json_field_str_value_buffer(response, "Description");
+      remove_json_field_buffer(response, "Warning");
+      remove_json_field_buffer(response, "BadgeLockedURL");
+      remove_json_field_buffer(response, "BadgeURL");
+      remove_json_field_buffer(response, "ImageIconURL");
+      remove_json_field_buffer(response, "Rarity");
+      remove_json_field_buffer(response, "RarityHardcore");
+      remove_json_field_buffer(response, "Author");
+      remove_json_field_buffer(response, "RichPresencePatch");
+      clean_json_field_array_value_buffer(response, "Leaderboards");
+      remove_achievements_with_flags_5_buffer(response);
+      
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing achievements with MemAddr > 4KB"));
+        remove_achievements_with_long_MemAddr_buffer(response, 4096);
+      }
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing achievements with MemAddr > 2KB"));
+        remove_achievements_with_long_MemAddr_buffer(response, 2048);
+      }
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing achievements with MemAddr > 1KB"));
+        remove_achievements_with_long_MemAddr_buffer(response, 1024);
+      }
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing achievements with MemAddr > 768B"));
+        remove_achievements_with_long_MemAddr_buffer(response, 768);
+      }
+      if (response.length() > SERIAL_MAX_PICO_BUFFER) {
+        Serial.println(F("removing achievements with MemAddr > 512B"));
+        remove_achievements_with_long_MemAddr_buffer(response, 512);
+      }
+      
+      Serial.println(response.c_str());
+      Serial.print(F("NEW PATCH LENGTH: "));
+      Serial.println(response.length());
+    } else if (strncmp(data, "r=login", 7) == 0) {
+      remove_json_field_buffer(response, "AvatarUrl");
+    }
+  }
+  
+  if (state < 198 && response.length() < SERIAL_MAX_PICO_BUFFER) {
+    Serial0.print(F("RESP="));
+    Serial0.print(request_id);
+    Serial0.print(F(";200;"));
+    
+    const char *ptr = response.c_str();
+    uint32_t len = response.length();
+    uint32_t offset = 0;
+    
+    while (offset < len) {
+      uint32_t chunk_len = min((uint32_t)SERIAL_COMM_CHUNK_SIZE, (uint32_t)(len - offset));
+      Serial0.write((const uint8_t *)&ptr[offset], chunk_len);
+      Serial0.flush();
+      offset += chunk_len;
+      delay(SERIAL_COMM_TX_DELAY_MS);
+    }
+    Serial0.print(F("\r\n"));
+    
+    Serial.print(F("RESP="));
+    Serial.print(request_id);
+    Serial.println(F(";"));
+  }
+  
+  response.clear();
+  
+  // After patch, release large buffer and reallocate small buffer
+  if (is_patch_request) {
+    Serial.println(F("Releasing large buffer and restoring small buffer..."));
+    response.release();
+    if (response.reserve(SMALL_BUFFER_SIZE)) {
+      Serial.print(F("Buffer restored to ")); Serial.print(response.capacity()); Serial.println(F(" bytes"));
+    }
+    // print_memory_stats("AFTER SHRINK");
+    // Restore WiFi power save
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  }
+}
+
+
+/**
+ * Handler for READ_CRC command - Cartridge CRCs sent by Pico
+ * @param cmd Pointer to data after "READ_CRC="
+ * @param cmd_len Length of data
+ */
+void handle_read_crc_command(const char* cmd, size_t cmd_len) {
+  if (state != STATE_WAITING_CRC) {
+    Serial0.print(F("COMMAND_IGNORED_WRONG_STATE\r\n"));
+    Serial.print(F("COMMAND_IGNORED_WRONG_STATE\r\n"));
+    return;
+  }
+  
+  // Remove trailing whitespace
+  while (cmd_len > 0 && (cmd[cmd_len - 1] == '\r' || cmd[cmd_len - 1] == '\n' || cmd[cmd_len - 1] == ' ')) {
+    cmd_len--;
+  }
+  
+  // Expected format: XXXXXXXX
+  if (cmd_len < 8) {
+    Serial.println(F("READ_CRC: data too short"));
+    state = STATE_ERROR_CARTRIDGE_NOT_FOUND;
+    return;
+  }
+  
+  // Extract begin_CRC (first 8 characters)
+  char begin_CRC[16];
+  memcpy(begin_CRC, cmd, 8);
+  begin_CRC[8] = '\0';
+  
+
+  // debug: force a game to test - used to fix ninja gaiden  
+  // memcpy(end_CRC, "44B6DB79", 8);
+  // memcpy(begin_CRC, "F5E0E7DC", 8);
+
+  Serial.print(F("READ_CRC="));
+  Serial.write(cmd, cmd_len);
+  Serial.println();
+  Serial.print(F("BEGIN_CRC="));
+  Serial.println(begin_CRC);
+  
+  // Search MD5 by initial CRC - use char* version to avoid fragmentation
+  md5_global[0] = '\0';
+  bool found = get_MD5(begin_CRC, md5_global, sizeof(md5_global));
+  
+  if (!found) {
+    Serial0.print(F("CRC_NOT_FOUND\r\n"));
+    Serial.print(F("CRC_NOT_FOUND\r\n"));
+    state = STATE_ERROR_CARTRIDGE_NOT_FOUND;
+  } else {
+    Serial0.print(F("CRC_FOUND_MD5="));
+    Serial0.print(md5_global);
+    Serial0.print(F("\r\n"));
+    Serial.print(F("CRC_FOUND_MD5=")); 
+    Serial.println(md5_global);
+    state = STATE_CRC_FOUND;
+  }
+}
+
+/**
+ * Handler for A= command - Achievement unlocked
+ * @param cmd Pointer to data after "A="
+ * @param cmd_len Length of data
+ */
+void handle_achievement_command(const char* cmd, size_t cmd_len) {
+  // Format: 123456;Cruise Control;https://media.retroachievements.org/Badge/348421.png
+  Serial.print(F("A="));
+  Serial.write(cmd, cmd_len);
+  Serial.println();
+  
+  // Find first ';' (end of ID)
+  int pos1 = find_char(cmd, cmd_len, ';');
+  if (pos1 < 0) {
+    Serial.println(F("A: invalid format - no id separator"));
+    return;
+  }
+  
+  // Extract ID
+  char id_str[16];
+  size_t id_len = pos1;
+  if (id_len >= sizeof(id_str)) id_len = sizeof(id_str) - 1;
+  memcpy(id_str, cmd, id_len);
+  id_str[id_len] = '\0';
+  
+  // Advance after first ';'
+  const char* remaining = cmd + pos1 + 1;
+  size_t remaining_len = cmd_len - pos1 - 1;
+  
+  // Find second ';' (end of title)
+  int pos2 = find_char(remaining, remaining_len, ';');
+  if (pos2 < 0) {
+    Serial.println(F("A: invalid format - no title separator"));
+    return;
+  }
+  
+  // Extract title
+  char title_str[128];
+  size_t title_len = pos2;
+  if (title_len >= sizeof(title_str)) title_len = sizeof(title_str) - 1;
+  memcpy(title_str, remaining, title_len);
+  title_str[title_len] = '\0';
+  
+  // URL is the rest
+  const char* url_ptr = remaining + pos2 + 1;
+  size_t url_len = remaining_len - pos2 - 1;
+  
+  // Remove trailing whitespace
+  while (url_len > 0 && (url_ptr[url_len - 1] == '\r' || url_ptr[url_len - 1] == '\n' || url_ptr[url_len - 1] == ' ')) {
+    url_len--;
+  }
+  
+  char url_str[256];
+  if (url_len >= sizeof(url_str)) url_len = sizeof(url_str) - 1;
+  memcpy(url_str, url_ptr, url_len);
+  url_str[url_len] = '\0';
+  
+  // Create achievement struct
+  achievements_t achievement;
+  achievement.id = atoi(id_str);
+  achievement.title = String(title_str);
+  achievement.url = String(url_str);
+  
+  // Increment unlocked counter
+  unlocked_achievements++;
+  
+  if (fifo_enqueue(&achievements_fifo, achievement) == false) {
+    Serial.print(F("FIFO_FULL\r\n"));
+  } else {
+    Serial.print(F("ACHIEVEMENT_ADDED\r\n"));
+  }
+}
+
+/**
+ * Handler for GAME_INFO= command - Game information
+ * @param cmd Pointer to data after "GAME_INFO="
+ * @param cmd_len Length of data
+ */
+void handle_game_info_command(const char* cmd, size_t cmd_len) {
+  // Format: 1496;R.C. Pro-Am;https://media.retroachievements.org/Images/052570.png
+  
+  // Find first ';' (end of game_id)
+  int pos1 = find_char(cmd, cmd_len, ';');
+  if (pos1 < 0) {
+    Serial.println(F("GAME_INFO: invalid format"));
+    return;
+  }
+  
+  // Extract game_id
+  char id_str[16];
+  size_t id_len = pos1;
+  if (id_len >= sizeof(id_str)) id_len = sizeof(id_str) - 1;
+  memcpy(id_str, cmd, id_len);
+  id_str[id_len] = '\0';
+  game_id = String(id_str);
+  
+  // Reset achievement counters for new game
+  total_achievements = 0;
+  unlocked_achievements = 0;
+  
+  // Advance
+  const char* remaining = cmd + pos1 + 1;
+  size_t remaining_len = cmd_len - pos1 - 1;
+  
+  // Find second ';' (end of name)
+  int pos2 = find_char(remaining, remaining_len, ';');
+  if (pos2 < 0) {
+    Serial.println(F("GAME_INFO: invalid format - no name separator"));
+    return;
+  }
+  
+  // Extrair game_name
+  char name_str[128];
+  size_t name_len = pos2;
+  if (name_len >= sizeof(name_str)) name_len = sizeof(name_str) - 1;
+  memcpy(name_str, remaining, name_len);
+  name_str[name_len] = '\0';
+  game_name = String(name_str);
+  
+  // URL is the rest
+  const char* url_ptr = remaining + pos2 + 1;
+  size_t url_len = remaining_len - pos2 - 1;
+  
+  // Remove trailing whitespace
+  while (url_len > 0 && (url_ptr[url_len - 1] == '\r' || url_ptr[url_len - 1] == '\n' || url_ptr[url_len - 1] == ' ')) {
+    url_len--;
+  }
+  
+  char url_str[256];
+  if (url_len >= sizeof(url_str)) url_len = sizeof(url_str) - 1;
+  memcpy(url_str, url_ptr, url_len);
+  url_str[url_len] = '\0';
+  game_image = String(url_str);
+  
+  if (game_id == "0") {
+    state = STATE_ERROR_CARTRIDGE_NOT_FOUND;
+    return;
+  }
+  
+  setSemaphore(LED_ON, LED_GREEN);
+  
+  char file_name[64];
+  sprintf(file_name, "/title_%s.png", game_id.c_str());
+  try_download_file(game_image, file_name);
+  
+  // Extract file name from URL
+  int last_slash = game_image.lastIndexOf("/");
+  if (last_slash >= 0) {
+    game_image = game_image.substring(last_slash + 1);
+  }
+  
+  // Truncate game name if too long
+  String esp_game_name = game_name;
+  if (esp_game_name.length() > 18) {
+    esp_game_name = esp_game_name.substring(0, 15) + "...";
+  }
+  
+  char game_display[32];
+  snprintf(game_display, sizeof(game_display), " * %s * ", esp_game_name.c_str());
+  
+  print_line("Cartridge identified:", 1, 0);
+  print_line(game_display, 2, 0);
+  print_line("please RESET the console", 4, 0);
+  Serial.println(game_name);
+  
+  // Enable the BUS
+  digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_ENABLE_BUS);
+}
+
+/**
+ * Handler for ACH_SUMMARY= command - Summary of achievements
+ * @param cmd Pointer to data after "ACH_SUMMARY="
+ * @param cmd_len Length of data
+ * Format: unlocked;total
+ */
+void handle_ach_summary_command(const char* cmd, size_t cmd_len) {
+  // Find ';' separator
+  int pos = find_char(cmd, cmd_len, ';');
+  if (pos < 0) {
+    Serial.println(F("ACH_SUMMARY: invalid format"));
+    return;
+  }
+  
+  // Extract unlocked
+  char unlocked_str[16];
+  size_t unlocked_len = pos;
+  if (unlocked_len >= sizeof(unlocked_str)) unlocked_len = sizeof(unlocked_str) - 1;
+  memcpy(unlocked_str, cmd, unlocked_len);
+  unlocked_str[unlocked_len] = '\0';
+  unlocked_achievements = (uint16_t)atoi(unlocked_str);
+  
+  // Extract total
+  const char* total_ptr = cmd + pos + 1;
+  size_t total_len = cmd_len - pos - 1;
+  
+  // Remove trailing whitespace
+  while (total_len > 0 && (total_ptr[total_len - 1] == '\r' || total_ptr[total_len - 1] == '\n' || total_ptr[total_len - 1] == ' ')) {
+    total_len--;
+  }
+  
+  char total_str[16];
+  if (total_len >= sizeof(total_str)) total_len = sizeof(total_str) - 1;
+  memcpy(total_str, total_ptr, total_len);
+  total_str[total_len] = '\0';
+  total_achievements = (uint16_t)atoi(total_str);
+  
+  Serial.print(F("ACH_SUMMARY: "));
+  Serial.print(unlocked_achievements);
+  Serial.print(F("/"));
+  Serial.println(total_achievements);
+}
+
+/**
+ * Handler for GB_RESETED command - User reset the GB
+ */
+void handle_gb_reset_command() {
+  uint8_t random = (uint8_t)esp_random();
+  game_session = String(random);
+  
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  init_websocket();
+  char aux[512];
+  send_ws_data("RESET");
+  sprintf(aux, "G=%s;%s;%s;%s", game_session.c_str(), game_id.c_str(), game_name.c_str(), game_image.c_str());
+  if (ws_client) {
+    ws_client->text(aux);
+  }
+#endif
+  
+  show_title_screen();
+  state = STATE_IDLE;
+}
+
+// Sync with Pico - sends SYNC command and waits for SYNC_ACK or PICO_READY
+// Returns true if sync successful, false if failed after maxRetries
+bool syncWithPico(int maxRetries = 3) {
+  print_line("Syncing with Pico...", 0, 1);
+  
+  for (int i = 0; i < maxRetries; i++) {
+    // Clear any garbage in receive buffer
+    while (Serial0.available() > 0) Serial0.read();
+    
+    Serial0.print(F("SYNC\r\n"));
+    Serial0.flush();
+    
+    unsigned long start = millis();
+    while (millis() - start < 1000) { // 1 second timeout
+      if (Serial0.available() > 0) {
+        String response = Serial0.readStringUntil('\n');
+        response.trim();
+        if (response.startsWith("SYNC_ACK") || response.startsWith("PICO_READY")) {
+          Serial.println(F("Pico sync OK"));
+          return true;
+        }
+      }
+      delay(10);
+    }
+    
+    // Timeout - try reset
+    Serial.print(F("Pico sync timeout, attempt "));
+    Serial.println(i + 1);
+    Serial0.print(F("RESET\r\n"));
+    Serial0.flush();
+    delay(500); // Wait for Pico to reboot
+  }
+  
+  Serial.println(F("Failed to sync with Pico after all retries"));
+  return false;
+}
+
+// arduino-esp32 entry point
 void setup()
 {
-  // memset(str_buffer, 0, STRING_BUFFER_SIZE);
-  // config mux pin
-  pinMode(MUX, OUTPUT);
-  digitalWrite(MUX, MUX_DISABLE_BUS); // isolate the cartridge
+ 
+  setCpuFrequencyMhz(80);
+  // disable i2c
+  Wire.end();
+  // BLEDevice::deinit(true);
+
+  // config analog switch control pin
+  pinMode(ANALOG_SWITCH_PIN, OUTPUT);
+  digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_DISABLE_BUS); // isolate the cartridge from GB
+
+  //config lcd brightness
+  pinMode(LCD_BRIGHTGBS_PIN, OUTPUT);
+  analogWrite(LCD_BRIGHTGBS_PIN, 192); // set the brightness of the TFT screen
+
+  // config the led status pin
+  pinMode(LED_STATUS_GREEN_PIN, OUTPUT);
+  pinMode(LED_STATUS_RED_PIN, OUTPUT);
+
+  setSemaphore(LED_BLINK_MEDIUM, LED_YELLOW);
+
+  Serial.begin(9600);    // initialize the serial port
+  Serial0.setTimeout(2); // 2ms timeout for Serial0
+  Serial0.begin(115200);
+  // consume any garbage in the serial buffer before communicating with the pico
+  if (Serial0.available() > 0)
+  {
+    Serial0.readString();
+    delay(10);
+  }
+
+  delay(1000);
+  
+
+  // print_memory_stats("BEFORE LARGE BUFFER ALLOCATION");
+  
+  if (response.reserve(LARGE_BUFFER_SIZE)) {
+    Serial.print(F("Large response buffer allocated: ")); 
+    Serial.print(LARGE_BUFFER_SIZE); 
+    Serial.println(F(" bytes"));
+  } else {
+    // Tentar tamanhos menores se 90KB falhar
+    size_t sizes[] = {85000, 80000, 75000, 70000, 65000};
+    bool allocated = false;
+    for (int i = 0; i < 5 && !allocated; i++) {
+      if (response.reserve(sizes[i])) {
+        Serial.print(F("Response buffer allocated: ")); 
+        Serial.print(sizes[i]); 
+        Serial.println(F(" bytes"));
+        allocated = true;
+      }
+    }
+    if (!allocated) {
+      Serial.println(F("FATAL: Could not allocate response buffer!"));
+    }
+  }
+  
+  // print_memory_stats("AFTER LARGE BUFFER ALLOCATION");
 
   // config reset pin
   pinMode(RESET_PIN, INPUT);
 
-  beginEEPROM(false);
+  // Inicializar buffer serial fixo
+  serial_buffer_len = 0;
+  serial_buffer[0] = '\0';
 
-  fifo_init(&achievements_fifo);
+  // initialize global strings
+  game_id = "0";
+  game_name = "not identified";
+  // base_url agora é const char* global, não precisa inicializar aqui
 
-  configureWifiManager();
+  // initialize stuff
+  init_EEPROM(false); // initialize the EEPROM
 
-  tft.begin();
-  Serial.begin(9600);
-  Serial0.setTimeout(2); // 2ms timeout for Serial0
-  Serial0.begin(115200);
-  delay(250);
+  fifo_init(&achievements_fifo); // initialize the achievement fifo
 
-  // Initialise LittleFS
-  if (!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED))
+  
+
+  // delay(250);
+  if (!LittleFS.begin(FORMAT_LITTLEFS_IF_FAILED)) // Initialise LittleFS
   {
-    Serial.print("LittleFS initialisation failed!");
+    Serial.print(F("LittleFS initialisation failed!")); // debug
+    setSemaphore(LED_BLINK_FAST, LED_RED);
     while (1)
       yield(); // Stay here twiddling thumbs waiting
   }
 
-  Serial0.print("VERSION=0.8\r\n");
-  Serial0.print("RESET\r\n");
-  delay(250);
+  char esp_version[32];
+  sprintf(esp_version, "ESP32_VERSION=%s\r\n", VERSION);
+  Serial0.print(esp_version); // send the version to the pico - debug
 
-  tft.fillScreen(TFT_YELLOW);
-  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
+#ifdef ENABLE_LCD
+  initLCD ();
+#endif
 
-  tft.setCursor(10, 10, 4);
-  tft.setTextSize(1);
-  tft.println("RetroAchievements");
-  tft.setCursor(140, 40, 4);
-  tft.println("Adapter");
+  // Sync with Pico - ensures both devices are in sync after ESP32 reset
+  if (!syncWithPico()) {
+    print_line("Pico sync failed!", 0, 2);
+    print_line("Check connection", 1, 2);
+    print_line("Power cycle needed", 2, 2);
+    play_error_sound();
+    setSemaphore(LED_BLINK_FAST, LED_RED);
+    // Halt execution - user must power cycle
+    while (true) {
+      delay(1000);
+    }
+  }
 
-  tft.fillRoundRect(16, 76, 208, 128, 15, TFT_BLUE);
-  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
-
-  tft.setCursor(75, 220, 2);
-  tft.println("by Odelot & GH");
-
+  // check if the reset button is pressed and handle the reset routine
   handle_reset();
 
+
+  // Pré-inicializar o cliente SSL global (configura os buffers SSL)
+  globalSecureClient.setInsecure();
+  globalSecureClient.setTimeout(15);
+  httpClientInitialized = true;
+  
+  Serial.println(F("Global HTTP client initialized"));
+  // print_memory_stats("AFTER SSL CLIENT INIT");
+
+  // check if the EEPROM is configured. If not, start the configuration portal
   int wifi_configuration_tries = 0;
   bool wifi_configured = false;
-  bool configured = isConfigured();
+  bool configured = is_eeprom_configured();
   if (!configured)
   {
+    response.reserve(SMALL_BUFFER_SIZE);
+    WiFiManager wm;
+    WiFiManagerParameter custom_p1(html_p1);
+    WiFiManagerParameter custom_p2(html_p2);
+    WiFiManagerParameter custom_param_1("un", NULL, "", 20, " required autocomplete='off'");
+    WiFiManagerParameter custom_p3(html_p3);
+    WiFiManagerParameter custom_param_2("up", NULL, "", 255, " type='password' required");
+    WiFiManagerParameter custom_s(html_s);
+    wifi_manager_init(wm); // initialize the wifi manager
+    wm.addParameter(&custom_p1);
+    wm.addParameter(&custom_p2);
+    wm.addParameter(&custom_param_1);
+    wm.addParameter(&custom_p3);
+    wm.addParameter(&custom_param_2);
+    wm.addParameter(&custom_s);
     while (!configured)
     {
       if (wifi_configuration_tries == 0 && !wifi_configured)
       {
+        setSemaphore(LED_BLINK_MEDIUM, LED_YELLOW); 
         print_line(" Configure the Adapter:", 0, 1);
         print_line("Connect to its wifi network", 1, -1, -16);
         print_line("named \"GB_RA_ADAPTER\",", 2, -1, -16);
         print_line("password: 12345678, and ", 3, -1, -16);
-        print_line("then open http://192.186.1.1", 4, -1, -16);
+        print_line("then open http://192.168.1.1", 4, -1, -16);
         play_attention_sound();
       }
       else if (wifi_configuration_tries > 0 && !wifi_configured)
       {
+        setSemaphore(LED_BLINK_SLOW, LED_RED);
         print_line("Could not connect to wifi", 0, 2);
         print_line("network!", 1, -1, 16);
         print_line("check it and try again", 3, -1, 16);
@@ -850,6 +2996,7 @@ void setup()
       }
       else if (wifi_configured)
       {
+        setSemaphore(LED_BLINK_MEDIUM, LED_RED);
         print_line("Could not log in", 0, 2);
         print_line("RetroAchievements!", 1, -1, 16);
         print_line("check the credentials", 3, -1, 16);
@@ -858,7 +3005,8 @@ void setup()
       }
       if (wm.startConfigPortal("GB_RA_ADAPTER", "12345678"))
       {
-        Serial.print("connected...yeey :)");
+        setSemaphore(LED_BLINK_SLOW, LED_GREEN);
+        Serial.print(F("connected...yeey :)"));
         wifi_configured = true;
         clean_screen_text();
         print_line("Wifi OK!", 0, 0);
@@ -866,26 +3014,34 @@ void setup()
         String temp_ra_pass = custom_param_2.getValue();
         ra_user_token = try_login_RA(temp_ra_user, temp_ra_pass);
         Serial.print(ra_user_token);
-        if (ra_user_token.compareTo("null") != 0)
+        if (ra_user_token.compareTo("") != 0)
         {
+          setSemaphore(LED_BLINK_MEDIUM, LED_GREEN);
           print_line("Logged in RA!", 1, 0);
           play_success_sound();
-          Serial.println("saving configuration info in eeprom");
+          Serial.println(F("saving configuration info in eeprom"));
           save_configuration_info_eeprom(temp_ra_user, temp_ra_pass);
+          // Reset Pico before restarting ESP32 to keep them in sync
+          Serial0.print(F("RESET\r\n"));
+          Serial0.flush();
+          delay(500);
+          ESP.restart(); // just to play safe as we are using all the RAM we can get to receive the achievement list
         }
         else
         {
-          Serial.print("could not log in RA");
+          setSemaphore(LED_BLINK_FAST, LED_RED);
+          Serial.print(F("could not log in RA"));
           clean_screen_text();
         }
       }
       else
       {
-        Serial.print("not connected...booo :(");
+        setSemaphore(LED_BLINK_MEDIUM, LED_RED);
+        Serial.print(F("not connected...booo :("));
         clean_screen_text();
         wifi_configuration_tries += 1;
       }
-      configured = isConfigured();
+      configured = is_eeprom_configured();
     }
   }
   else
@@ -897,418 +3053,238 @@ void setup()
     {
       WiFi.begin();
       while (WiFi.status() != WL_CONNECTED)
-        yield();
+        delay(500);
     }
+    setSemaphore(LED_BLINK_SLOW, LED_GREEN);
     print_line("Wifi OK!", 0, 0); // TODO: implement timeout
-    String ra_user = read_ra_user_from_eeprom();
-    String ra_pass = read_ra_pass_from_eeprom();
+    
+    // Usar buffers fixos para credenciais
+    char ra_user[64];
+    char ra_pass[128];
+    read_ra_user_from_eeprom(ra_user, sizeof(ra_user));
+    read_ra_pass_from_eeprom(ra_pass, sizeof(ra_pass));
+    
     print_line("Logging in RA...", 1, 1);
-    ra_user_token = try_login_RA(ra_user, ra_pass);
-    if (ra_user_token.compareTo("null") != 0)
+    ra_user_token = try_login_RA(String(ra_user), String(ra_pass));
+    if (ra_user_token.compareTo("") != 0)
     {
+      setSemaphore(LED_BLINK_MEDIUM, LED_GREEN);
       print_line("Logged in RA!", 1, 0);
       play_success_sound();
+      // print_memory_stats("AFTER LOGIN SUCCESS");
     }
     else
     {
-      print_line("Could not log in RA!", 1, 2);
-      print_line("Consider reset the adapter", 3, -1, 16);
-      play_error_sound();
+      setSemaphore(LED_BLINK_FAST, LED_RED);
+      print_line("Wrong credential or RA offline", 2, -1, -22);
+      print_line("Consider reset the adapter", 3, -1, -22 );
+      state = STATE_ERROR_LOGIN_FAILED;      
+      return;
     }
   }
-  char token_and_user[512];
-  sprintf(token_and_user, "TOKEN_AND_USER=%s,%s\r\n", ra_user_token.c_str(), read_ra_user_from_eeprom().c_str());
-  Serial0.print(token_and_user);
-  Serial.print(token_and_user);          // DEBUG
-  Serial.print("TFT_INIT\r\n"); // DEBUG
-  delay(250);
-  state = 0;
-  Serial.print("setup end");
-  // pico sends a random char by Serial or maybe it is a esp32c3 supermini bug
-  if (Serial0.available() > 0)
-  {
-    Serial0.readString();
-  }
+
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  config_mDNS();
+#endif
+  // handle reconnects
+  WiFi.onEvent(onWiFiConnect, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(onWiFiDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.onEvent(onWiFiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+
+  // print_memory_stats("BEFORE SENDING TOKEN TO PICO");
+
+  // send the token and user to the pico (needed)
+  // Ler user para buffer fixo antes de liberar EEPROM
+  char ra_user_for_pico[64];
+  read_ra_user_from_eeprom(ra_user_for_pico, sizeof(ra_user_for_pico));
+  
+  char token_and_user[128];
+  sprintf(token_and_user, "TOKEN_AND_USER=%s,%s\r\n", ra_user_token.c_str(), ra_user_for_pico);
+
+  delay(250);                   // make sure pico restarted
+  Serial.print(token_and_user); // debug
+  Serial0.print(token_and_user);  
+  state = STATE_IDENTIFY_CARTRIDGE;
+
+  // modem sleep
+  WiFi.setSleep(true);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  // esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+  // Liberar buffer da EEPROM para economizar RAM (~256 bytes)
+  // Se precisar salvar novamente, chame EEPROM.begin() antes
+  EEPROM.end();
+
+  // print_memory_stats("END OF SETUP");
+
+  Serial.print(F("setup end")); // debug
 }
 
-void show_title_screen()
-{
-  tft.setTextColor(TFT_BLACK, TFT_YELLOW, true);
-
-  tft.setTextSize(1);
-  tft.setTextPadding(240);
-  tft.drawString("", 0, 10, 4);
-  tft.drawString("", 0, 40, 4);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(gameName, 120, 40, 4);
-  tft.setTextPadding(0);
-
-  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
-  xpos = 72;
-  ypos = 92;
-  String fileName = "/title_" + gameId + ".png";
-  int16_t rc = png.open(fileName.c_str(), pngOpen, pngClose, pngRead, pngSeek, pngDraw);
-  if (rc == PNG_SUCCESS)
-  {
-    // Serial.print("Successfully opened png file"); // DEBUG
-    // Serial.printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType()); // DEBUG
-    tft.startWrite();
-    uint32_t dt = millis();
-    rc = png.decode(NULL, 0);
-    // Serial.print(millis() - dt); // DEBUG
-    // Serial.print("ms"); // DEBUG
-    tft.endWrite();
-    png.close();
-  }
-  // play_sound_achievement_unlocked();
-  alreadyShowedTitleScreen = true;
-}
-
-void show_achievement(achievements_t achievement)
-{
-  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
-  print_line("New Achievement Unlocked!", 0, 0);
-  print_line("", 1, 0);
-  print_line("", 2, 0);
-  print_line("", 3, 0);
-  print_line(achievement.title, 4, -1);
-  Serial.println(achievement.title);
-  xpos = 50;
-  ypos = 110;
-  char fileName[64];
-  sprintf(fileName, "/achievement_%d.png", achievement.id);
-  download_file_to_littleFS(achievement.url, fileName);
-  int16_t rc = png.open(fileName, pngOpen, pngClose, pngRead, pngSeek, pngDraw);
-  if (rc == PNG_SUCCESS)
-  {
-    Serial.print("Successfully opened png file");
-    Serial.printf("image specs: (%d x %d), %d bpp, pixel type: %d\n", png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType());
-    tft.startWrite();
-    uint32_t dt = millis();
-    rc = png.decode(NULL, 0);
-    Serial.print(millis() - dt);
-    Serial.print("ms");
-    tft.endWrite();
-    png.close();
-  }
-  play_sound_achievement_unlocked();
-  comebackToTitleScreen = true;
-  comebackToTitleScreenTS = millis();
-}
-
-//=========================================v==========================================
-//                                      pngDraw
-//====================================================================================
-// This next function will be called during decoding of the png file to
-// render each image line to the TFT.  If you use a different TFT library
-// you will need to adapt this function to suit.
-// Callback function to draw pixels to the display
-void pngDraw(PNGDRAW *pDraw)
-{
-  uint16_t lineBuffer[MAX_IMAGE_WIDTH];
-  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
-  tft.pushImage(xpos, ypos + pDraw->y, pDraw->iWidth, 1, lineBuffer);
-}
-
-void decodePixel(uint16_t x, uint16_t y, uint16_t color)
-{
-  tft.drawPixel(x + xpos, y + ypos, color);
-}
-
-bool prefix(const char *pre, const char *str)
-{
-  return strncmp(pre, str, strlen(pre)) == 0;
-}
-
-uint32_t frame = 0;
-
+// arduino-esp32 main loop
 void loop()
 {
-  // reconnect if wifi got disconnected
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    WiFi.begin();
-    while (WiFi.status() != WL_CONNECTED)
-      yield();
+
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+  if (websocket_initialized && ws != nullptr) {
+    uint32_t delta_ws_cleanup = millis() - last_ws_cleanup;
+    last_ws_cleanup = millis();
+    if (delta_ws_cleanup > 1000)
+    {
+      ws->cleanupClients();
+    }
   }
-  long cbDelta = millis() - comebackToTitleScreenTS;
-  if (comebackToTitleScreen == true && cbDelta > 15000)
+
+  // #TODO last ping was too long ago, closes the connection
+#endif
+
+  // Update WiFi status every 10 seconds after title screen was shown
+  if (already_showed_title_screen && (millis() - last_wifi_status_update > 10000))
   {
-    comebackToTitleScreen = false;
+    last_wifi_status_update = millis();
+    showWifiStatus();
+  }
+
+  long go_back_to_title_delta_timestamp = millis() - go_back_to_title_screen_timestamp;
+  // check if we can go back to the title screen after showing the achievement for 15 seconds
+  if (go_back_to_title_screen == true && go_back_to_title_delta_timestamp > 15000)
+  {
+    go_back_to_title_screen = false;
     if (fifo_is_empty(&achievements_fifo))
     {
+      
       show_title_screen();
     }
   }
 
-  if (state > 200)
-  {              // 200 - 254 are error states
-    state = 128; // do nothing
-    print_line("Cartridge not identified", 1, 2);
+  // handle errors during the cartridge identification - unified error handling
+  if (isErrorState(state))
+  {
+    setSemaphore(LED_BLINK_FAST, LED_RED);
+    const char* errorMsg = getStateErrorMessage(state);
+    print_line(errorMsg, 1, 2);
+    
+    if (state == STATE_ERROR_CONNECTIVITY) {
+      print_line("It's not recording achievs", 2, 2);
+    }
+    
     print_line("Turn off the console", 4, 2);
-    digitalWrite(MUX, MUX_ENABLE_BUS); // enable cartridge
-
-    // TEST
-    Serial0.print("START_WATCH\r\n");
-    Serial.print("START_WATCH\r\n");
+    play_error_sound();
+    state = STATE_IDLE; // do nothing - it will not enable the BUS, so the game will not boot
   }
 
-  if (state == 0)
+  // handle the cartridge identification
+  if (state == STATE_IDENTIFY_CARTRIDGE)
   {
+    setSemaphore(LED_BLINK_FAST, LED_GREEN);
     print_line("Identifying cartridge...", 1, 1);
 
-    // Tell Pico to read the cartridge and compute its MD5
-    Serial0.print("READ_CRC\r\n");
-    Serial.print("READ_CRC\r\n");
-    state = 1;
-  }
-  if (state == 2)
-  {
-    print_line("Cartridge identified!", 1, 1);
-    print_line(md5.c_str(), 2, 1);
-    digitalWrite(MUX, HIGH); // enable cartridge / allow console power-on
-    Serial0.print("START_WATCH\r\n");
-    Serial.print("START_WATCH\r\n");
-    state = 3;
+    Serial0.print(F("READ_CRC\r\n")); // send command to read cartridge crc
+    Serial.print(F("READ_CRC\r\n"));  // send command to read cartridge crc
+    delay(250);
+    state = STATE_WAITING_CRC;
+
+    // USEFUL FOR TESTING - FORCING SOME GAME, IN THIS CASE, RC PRO AM
+    // md5 = "2178cc3772b01c9f3db5b2de328bb992";
+    // state = STATE_CRC_FOUND;
   }
 
-  if (fifo_is_empty(&achievements_fifo) == false && Serial.available() == 0 && comebackToTitleScreen == false) // show achievements
+  // inform the pico to start the process to watch the BUS for memory writes
+  if (state == STATE_CRC_FOUND)
+  {
+    Serial0.print(F("START_WATCH\r\n"));
+    Serial.print(F("START_WATCH\r\n"));
+    state = STATE_WATCHING;
+  }
+
+  // if there is some achievement to be shown, show it
+  if (fifo_is_empty(&achievements_fifo) == false && Serial.available() == 0 && go_back_to_title_screen == false) // show achievements
   {
     achievements_t achievement;
     fifo_dequeue(&achievements_fifo, &achievement);
     show_achievement(achievement);
   }
 
+  // handle the serial communication with the pico - usando buffer fixo
   while (Serial0.available() > 0)
   {
-    int dataLenght = Serial0.available();
-    buffer += Serial0.readString();
-    // Serial.print(buffer);
-    if (buffer.length() > 2048)
-    {
-      buffer = ""; // clear buffer
-      Serial0.print("BUFFER_OVERFLOW\r\n");
-      Serial.print("BUFFER_OVERFLOW\r\n");
+    // Read only up to available space
+    size_t available_space = SERIAL_BUFFER_SIZE - serial_buffer_len - 1;
+    if (available_space > 0) {
+      size_t bytes_read = Serial0.readBytes(serial_buffer + serial_buffer_len, available_space);
+      serial_buffer_len += bytes_read;
+      serial_buffer[serial_buffer_len] = '\0'; // null-terminate
     }
-    if (buffer.indexOf("\r\n") > 0)
+    
+    // Check for overflow
+    if (serial_buffer_len >= SERIAL_BUFFER_SIZE - 1)
     {
-      // we have a command
-      String command = buffer.substring(0, buffer.indexOf("\n") + 1);
-      buffer = buffer.substring(buffer.indexOf("\n") + 1);
+      serial_buffer_len = 0;
+      serial_buffer[0] = '\0';
+      Serial0.print(F("BUFFER_OVERFLOW\r\n"));
+      Serial.print(F("BUFFER_OVERFLOW\r\n"));
+      continue;
+    }
 
-      if (command.startsWith("REQ"))
-      {
-        // example of requsest
-        // REQ=FF;M:POST;U:https://retroachievements.org/dorequest.php;D:r=login2&u=user&p=pass
-        const char user_agent[] = "GB_RA_ADAPTER/0.2 rcheevos/11.6";
-
-        String request = command.substring(4);
-        // Serial.println("REQ=" + request);
-        int pos = request.indexOf(";");
-        String request_id = request.substring(0, pos);
-        request = request.substring(pos + 1);
-        pos = request.indexOf(";");
-        String method = request.substring(2, pos);
-        request = request.substring(pos + 1);
-        pos = request.indexOf(";");
-        String url = request.substring(2, pos);
-        String data = request.substring(pos + 3);
-        // Serial.println("REQ_METHOD=" + method);
-        // Serial.println("REQ_URL=" + url);
-        // Serial.println("REQ_DATA=" + data);
-        int httpCode;
-
-        if (prefix("r=patch", data.c_str()) && ENABLE_SHRINK_LAMBDA == 1)
-        {
-          // change to a temporary aws lambda that shrinks the patch JSON
-          url = SHRINK_LAMBDA_URL;
-        }
-        // else {
-        client.setInsecure();
-        https.begin(client, url);
-        //}
-        https.setUserAgent(user_agent);
-
-        if (method == "POST")
-        {
-          https.addHeader("Content-Type", "application/x-www-form-urlencoded");
-          httpCode = https.POST(data);
-        }
-        else if (method == "GET")
-        {
-          httpCode = https.GET();
-        }
-        if (httpCode != HTTP_CODE_OK)
-        {
-          // TODO: handle errors
-          Serial0.print("REQ_ERROR=" + String(httpCode) + "\r\n");
-          Serial.print("REQ_ERROR=" + https.errorToString(httpCode) + "\r\n");
-        }
-        char httpCodeStr[4];
-        sprintf(httpCodeStr, "%03X", httpCode);
-        String response = https.getString();
-
-        if (prefix("r=patch", data.c_str()))
-        {
-          // print response size and header content size
-          Serial.print("PATCH LENGTH: ");
-          Serial.println(response.length());
-          clean_json_field_str_value(response, "Description");
-          remove_not_nested_json_field(response, "Warning");
-          remove_not_nested_json_field(response, "BadgeLockedURL");
-          remove_not_nested_json_field(response, "BadgeURL");
-          remove_not_nested_json_field(response, "ImageIconURL");
-          remove_not_nested_json_field(response, "Rarity");
-          remove_not_nested_json_field(response, "RarityHardcore");
-          remove_not_nested_json_field(response, "Author");
-          remove_not_nested_json_field(response, "RichPresencePatch");
-          Serial.print("NEW PATCH LENGTH: ");
-          Serial.println(response.length());
-        }
-        else if (prefix("r=login", data.c_str()))
-        {
-          remove_not_nested_json_field(response, "AvatarUrl");
-        }
-        Serial0.print("RESP=");
-        Serial0.print(request_id);
-        Serial0.print(";");
-        Serial0.print(httpCodeStr);
-        Serial0.print(";");
-
-        const char *ptr = response.c_str(); // Obtém ponteiro para o buffer da String
-        uint32_t len = response.length();
-        uint32_t offset = 0;
-
-        while (offset < len)
-        {
-          uint32_t chunkLen = min((uint32_t)CHUNK_SIZE, (uint32_t)(len - offset));
-          Serial0.write((const uint8_t *)&ptr[offset], chunkLen); // Envia bloco direto do buffer
-          Serial0.flush();                                        // Garante que o bloco foi enviado
-          offset += chunkLen;
-          delay(TX_DELAY_MS); // Pequeno atraso para evitar congestionamento no Pico
-        }
-        Serial0.print("\r\n");
-        Serial.print("RESP=");
-        Serial.print(request_id);
-        Serial.print(";");
-        Serial.print(httpCodeStr);
-        Serial.print(";");
-        Serial.print(response);
-        Serial.print("\r\n");
-        https.end();
+    // Process complete commands (terminated by \r\n)
+    int crlf_pos;
+    while ((crlf_pos = find_crlf(serial_buffer, serial_buffer_len)) >= 0)
+    {
+      // We have a complete command
+      size_t cmd_len = crlf_pos; // does not include \r\n
+      
+      // Dispatch to the appropriate handler
+      if (starts_with(serial_buffer, cmd_len, "REQ=")) {
+        handle_req_command(serial_buffer + 4, cmd_len - 4);
       }
-      else if (command.startsWith("MUX="))
-      {
-        {
-          int mux = command.substring(4).toInt();
-          if (mux == 0)
-          {
-            digitalWrite(MUX, MUX_ENABLE_BUS);
-          }
-          else
-          {
-            digitalWrite(MUX, MUX_DISABLE_BUS);
-          }
-          Serial0.print("MUX_SET\r\n");
-          Serial.print("MUX_SET\r\n");
-        }
+      else if (starts_with(serial_buffer, cmd_len, "READ_CRC=")) {
+        handle_read_crc_command(serial_buffer + 9, cmd_len - 9);
       }
-      else if (command.startsWith("CART_CRC="))
-      {
-        // Pico read CRC32 of first 512 bytes; look up MD5 in games.txt
-        if (state != 1)
-        {
-          Serial0.print("COMMAND_IGNORED_WRONG_STATE\r\n");
-          Serial.print("COMMAND_IGNORED_WRONG_STATE\r\n");
-        }
-        else
-        {
-          String crc = command.substring(9);
-          crc.trim();
-          Serial.print("CART_CRC=" + crc + "\r\n");
-          md5 = getMD5(crc);
-          if (md5.length() == 0)
-          {
-            Serial0.print("CRC_NOT_FOUND\r\n");
-            Serial.print("CRC_NOT_FOUND\r\n");
-            state = 254;
-          }
-          else
-          {
-            Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-            Serial.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-            state = 2;
-          }
-        }
+      else if (starts_with(serial_buffer, cmd_len, "A=")) {
+        handle_achievement_command(serial_buffer + 2, cmd_len - 2);
       }
-      else if (command.startsWith("CRC_NOT_FOUND"))
-      {
-
-        state = 254;
+      else if (starts_with(serial_buffer, cmd_len, "GAME_INFO=")) {
+        handle_game_info_command(serial_buffer + 10, cmd_len - 10);
       }
-      else if (command.startsWith("A="))
-      {
-        // example A=123456;Cruise Control;https://media.retroachievements.org/Badge/348421.png
-        Serial.print(command);
-        int pos = command.indexOf(";");
-        String achievements_id = command.substring(2, pos);
-        command = command.substring(pos + 1);
-        pos = command.indexOf(";");
-        String achievements_title = command.substring(0, pos);
-        command = command.substring(pos + 1);
-        String achievements_image = command;
-        achievements_image.trim();
-        achievements_t achievement;
-        achievement.id = achievements_id.toInt();
-        achievement.title = achievements_title;
-        achievement.url = achievements_image;
-        if (fifo_enqueue(&achievements_fifo, achievement) == false)
-        {
-          Serial.print("FIFO_FULL\r\n");
-        }
-        else
-        {
-          Serial.print("ACHIEVEMENT_ADDED\r\n");
-        }
+      else if (starts_with(serial_buffer, cmd_len, "ACH_SUMMARY=")) {
+        handle_ach_summary_command(serial_buffer + 12, cmd_len - 12);
       }
-      else if (command.startsWith("GAME_INFO="))
-      {
-        // example GAME_INFO=1496;R.C. Pro-Am;https://media.retroachievements.org/Images/052570.png
-        int pos = command.indexOf(";");
-        gameId = command.substring(10, pos);
-        command = command.substring(pos + 1);
-        pos = command.indexOf(";");
-        gameName = command.substring(0, pos);
-        command = command.substring(pos + 1);
-        String gameImage = command;
-        gameImage.trim();
-        char fileName[64];
-        sprintf(fileName, "/title_%s.png", gameId.c_str());
-        download_file_to_littleFS(gameImage.c_str(), fileName);
-
-        // if game name is longer than 18 chars, add ... at the end
-        if (gameName.length() > 18)
-        {
-          gameName = gameName.substring(0, 18 - 3) + "...";
-        }
-
-        print_line("Cartridge identified:", 1, 0);
-        print_line(" * " + gameName + " * ", 2, 0);
-        print_line("please RESET the console", 4, 0);
-        Serial.print(command);
+      else if (starts_with(serial_buffer, cmd_len, "GB_RESETED")) {
+        handle_gb_reset_command();
       }
-      else if (command.startsWith("NES_RESETED"))
-      {
-
-        show_title_screen();
-        // TODO play some sound?
-        state = 128; // do nothing
+      else if (starts_with(serial_buffer, cmd_len, "C=")) {
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+        // Create temporary String only for websocket
+        char temp[256];
+        size_t temp_len = min(cmd_len, sizeof(temp) - 1);
+        memcpy(temp, serial_buffer, temp_len);
+        temp[temp_len] = '\0';
+        send_ws_data(String(temp));
+#endif
       }
-      else
-      {
-        Serial.print("UNKNOWN=");
-        Serial.print(command);
+      else if (starts_with(serial_buffer, cmd_len, "P=")) {
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+        char temp[256];
+        size_t temp_len = min(cmd_len, sizeof(temp) - 1);
+        memcpy(temp, serial_buffer, temp_len);
+        temp[temp_len] = '\0';
+        send_ws_data(String(temp));
+#endif
       }
+      else {
+        Serial.print(F("UNKNOWN="));
+        Serial.write(serial_buffer, cmd_len);
+        Serial.println();
+      }
+      
+      // Remove processed command from buffer (including \r\n)      
+      size_t remove_len = crlf_pos + 2;
+      if (remove_len < serial_buffer_len) {
+        memmove(serial_buffer, serial_buffer + remove_len, serial_buffer_len - remove_len);
+        serial_buffer_len -= remove_len;
+      } else {
+        serial_buffer_len = 0;
+      }
+      serial_buffer[serial_buffer_len] = '\0';
     }
   }
   yield();

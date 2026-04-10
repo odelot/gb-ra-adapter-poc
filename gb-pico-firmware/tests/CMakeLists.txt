@@ -22,8 +22,8 @@ FetchContent_MakeAvailable(unity)
 
 FetchContent_Declare(
     rcheevos
-    GIT_REPOSITORY https://github.com/odelot/rcheevos
-    GIT_TAG        master
+    GIT_REPOSITORY https://github.com/RetroAchievements/rcheevos.git
+    GIT_TAG        v11.6.0
 )
 
 FetchContent_MakeAvailable(rcheevos)
