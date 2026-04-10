@@ -442,10 +442,11 @@ int main()
             gb_cart_header_t cart_header;
             if (cart_identify(md5, &cart_header)) {
                 char cmd[64];
-                sprintf(cmd, "CART_MD5=%s\r\n", md5);
+                sprintf(cmd, "CART_CRC=%s\r\n", md5);
                 uart_puts(UART_ID, cmd);
-                printf("CART_MD5=%s\n", md5);
-                state = 2;
+                printf("CART_CRC=%s\n", md5);
+                /* Wait for ESP32 to respond with CRC_FOUND_MD5=<md5> which sets state=2 */
+                state = 0;
             } else {
                 uart_puts(UART_ID, "CRC_NOT_FOUND\r\n");
                 printf("CART: identification failed\n");
@@ -585,6 +586,7 @@ int main()
                     strncpy(md5, md5_ptr, 32);
                     md5[32] = '\0';
                     printf("MD5=%s\r\n", md5);
+                    state = 2;
                 }
                 else if (prefix("RESET", command)) // RESET
                 {

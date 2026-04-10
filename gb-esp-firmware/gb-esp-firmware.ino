@@ -101,7 +101,8 @@ CRC MD5
 
 */
 
-String getMD5(String crc, bool firstBank)
+// Look up the MD5 for a given CRC32 in /games.txt (format: XXXXXXXX=md5)
+String getMD5(String crc)
 {
   const char *filePath = "/games.txt";
 
@@ -115,26 +116,23 @@ String getMD5(String crc, bool firstBank)
   String line;
   while (file.available())
   {
-    line = file.readStringUntil('\n'); // Lê uma linha do arquivo
-    int indexAfterComma = line.indexOf(',');
+    line = file.readStringUntil('\n');
     int indexAfterEqualSign = line.indexOf('=');
-
-    if (indexAfterComma != -1 && indexAfterEqualSign != -1)
+    if (indexAfterEqualSign == 8) // CRC32 is always 8 hex chars
     {
-      String crc1 = line.substring(0, indexAfterComma);
-      String crc2 = line.substring(indexAfterComma + 1, indexAfterEqualSign);
-      String md5 = line.substring(indexAfterEqualSign + 1);
-
-      if ( (firstBank && crc1.equalsIgnoreCase(crc)) || (!firstBank &&crc2.equalsIgnoreCase(crc)))
+      String fileCrc = line.substring(0, 8);
+      String fileMd5 = line.substring(9); // skip '='
+      fileMd5.trim();
+      if (fileCrc.equalsIgnoreCase(crc))
       {
         file.close();
-        return md5; // Retorna o MD5 se um dos CRCs for encontrado
+        return fileMd5;
       }
     }
   }
 
   file.close();
-  return ""; // Retorna string vazia se não encontrar
+  return "";
 }
 
 /*
@@ -1102,7 +1100,7 @@ void loop()
       {
         // example of requsest
         // REQ=FF;M:POST;U:https://retroachievements.org/dorequest.php;D:r=login2&u=user&p=pass
-        const char user_agent[] = "GB_RA_ADAPTER/0.1 rcheevos/11.6";
+        const char user_agent[] = "GB_RA_ADAPTER/0.2 rcheevos/11.6";
 
         String request = command.substring(4);
         // Serial.println("REQ=" + request);
@@ -1215,9 +1213,9 @@ void loop()
           Serial.print("MUX_SET\r\n");
         }
       }
-      else if (command.startsWith("CART_MD5="))
+      else if (command.startsWith("CART_CRC="))
       {
-        // Pico computed the MD5 directly from the cartridge ROM
+        // Pico read CRC32 of first 512 bytes; look up MD5 in games.txt
         if (state != 1)
         {
           Serial0.print("COMMAND_IGNORED_WRONG_STATE\r\n");
@@ -1225,42 +1223,15 @@ void loop()
         }
         else
         {
-          md5 = command.substring(9);
-          md5.trim();
-          Serial.print("CART_MD5=" + md5 + "\r\n");
-          // Send confirmation back (Pico already has the MD5 but this
-          // maintains protocol compatibility with CRC_FOUND_MD5 handler)
-          Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-          Serial.print("CRC_FOUND_MD5=" + md5 + "\r\n");
-          state = 2;
-        }
-      }
-      else if (command.startsWith("READ_CRC="))
-      {
-        if (state != 1)
-        {
-          Serial0.print("COMMAND_IGNORED_WRONG_STATE\r\n");
-          Serial.print("COMMAND_IGNORED_WRONG_STATE\r\n");
-        }
-        else
-        {
-          String data = command.substring(9);
-          data.trim();
-          Serial.print("READ_CRC=" + data + "\r\n"); // DEBUG
-          String beginCRC = data.substring(0, 8);
-          Serial.print("BEGIN_CRC=" + beginCRC + "\r\n");
-          String endCRC = data.substring(9);
-          Serial.print("END_CRC=" + endCRC + "\r\n");
-          md5 = getMD5(beginCRC, true);
-          if (md5.length() == 0)
-          {
-            md5 = getMD5(endCRC, false);
-          }
+          String crc = command.substring(9);
+          crc.trim();
+          Serial.print("CART_CRC=" + crc + "\r\n");
+          md5 = getMD5(crc);
           if (md5.length() == 0)
           {
             Serial0.print("CRC_NOT_FOUND\r\n");
             Serial.print("CRC_NOT_FOUND\r\n");
-            state = 254; // error - cartridge not found
+            state = 254;
           }
           else
           {
