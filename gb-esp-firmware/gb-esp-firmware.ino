@@ -6,7 +6,6 @@
 #include <JsonStreamingParser.h>
 #include <PNGdec.h>
 #include <StreamString.h>
-#include "rc_client.h"
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -353,16 +352,16 @@ int snd_notes_duration_achievement_unlocked[] = {
  * rcheevos
  */
 
-typedef struct
-{
-  rc_client_server_callback_t callback;
-  void *callback_data;
-} async_callback_data;
+// typedef struct
+// {
+//   rc_client_server_callback_t callback;
+//   void *callback_data;
+// } async_callback_data;
 
-rc_client_t *g_client = NULL;
-static void *g_callback_userdata = &g_client; /* dummy data */
-char rcheevos_userdata[16];
-async_callback_data async_data;
+// rc_client_t *g_client = NULL;
+// static void *g_callback_userdata = &g_client; /* dummy data */
+// char rcheevos_userdata[16];
+// async_callback_data async_data;
 
 uint16_t *unique_memory_addresses = NULL;
 uint16_t unique_memory_addresses_count = 0;
@@ -1073,10 +1072,10 @@ void loop()
     // md5 = "084f1e457749cdec86183189bd88ce69";
 
     // TEST - FORCING ZELDA LINKS AWAKENING
-    md5 = "5bc0913d533000522c7c9cac1ef6f97f";
+    // md5 = "5bc0913d533000522c7c9cac1ef6f97f";
 
     // TEST - FORCING SUPER MARIO LAND
-    // md5 = "c6cfb6cb982ac886faa83a1f0e597dc8";
+    md5 = "c6cfb6cb982ac886faa83a1f0e597dc8";
 
     // TEST - SEND MD5 TO PICO
     Serial0.print("CRC_FOUND_MD5=" + md5 + "\r\n");

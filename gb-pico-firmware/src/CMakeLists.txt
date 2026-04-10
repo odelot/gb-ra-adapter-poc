@@ -50,7 +50,7 @@ add_compile_definitions(RC_DISABLE_LUA=1)
 add_compile_definitions(RC_NO_THREADS=1)
 
 # Pull in our pico_stdlib which pulls in commonly used features
-target_link_libraries(${NAME} pico_stdlib pico_stdlib hardware_pio pico_multicore hardware_dma) 
+target_link_libraries(${NAME} pico_stdlib pico_stdlib hardware_pio pico_multicore hardware_dma hardware_clocks) 
 
 # enable usb output, disable uart output
 pico_enable_stdio_usb(${NAME} 1)
@@ -58,5 +58,9 @@ pico_enable_stdio_uart(${NAME} 0)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(${NAME})
+
+# Use custom linker script that places gb_opcodes.c and gb_cpu_emu.c in RAM
+# (excludes them from FLASH .text, so they fall through to .data section in RAM)
+pico_set_linker_script(${NAME} ${CMAKE_CURRENT_LIST_DIR}/memmap_custom.ld)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")

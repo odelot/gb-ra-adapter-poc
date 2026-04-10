@@ -1,11 +1,15 @@
 .program memoryBus
 
+; Capture the full bus on every Game Boy clock cycle.
+; in_pin_base = 8, so pin 17 = GPIO (8+17)%32 = GPIO 25 = M2 (CLK).
+; Uses manual push (no autopush) + 8-deep RX FIFO (TX+RX joined):
+; when FIFO is full, PIO stalls on `push` until CPU reads, keeping them in sync.
 
 .wrap_target
-    
-    wait 0 pin 24   ; wait for /WR to go LOW
-    ; wait 1 pin 25   ; wait for M2 to go HIGH    
-    in pins 32      ;capture 
+    wait 1 pin 17   ; wait for M2 (CLK) rising edge
+    wait 0 pin 17   ; wait for M2 (CLK) falling edge
+    mov isr pins     ; capture all pins into ISR
+    push             ; push ISR to RX FIFO (stalls if full)
 .wrap
 
 % c-sdk {
@@ -14,17 +18,22 @@ void memoryBus_program_init(PIO pio, uint sm, uint offset, float div) {
     pio_sm_config c = memoryBus_program_get_default_config(offset);
     sm_config_set_clkdiv(&c, div); //Clock
 
-    //GPIO setup    
+    //GPIO setup — all 28 pins as inputs
     pio_sm_set_consecutive_pindirs(pio, sm, 0, 28, false);
-    
-    sm_config_set_in_pins(&c, 0);
-    
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
-    sm_config_set_in_shift(&c, true, true, 0);
-    
+    // Start reading from GPIO 8 so the 32-bit word wraps around:
+    //  bits  0-15 : GPIO  8-23 = A0-A15  (address)
+    //  bits 16-23 : GPIO 24-31 = WR, M2, junk (control)
+    //  bits 24-31 : GPIO  0-7  = D0-D7   (data)
+    sm_config_set_in_pins(&c, 8);
+
+    // 8-deep RX FIFO (TX+RX joined) + manual push.
+    // We don't use TX, so joining doubles the RX FIFO from 4 to 8,
+    // giving the CPU more time between reads before PIO stalls.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_in_shift(&c, true, false, 32);
+
     pio_sm_init(pio, sm, offset, &c);
-    
 }
 
 %}
